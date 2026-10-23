@@ -36,6 +36,8 @@ jobs:
             uses-material-design: true
           EOF
           cat > lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'dart:convert';
           import 'dart:io';
           import 'package:flutter/material.dart';
           import 'package:gal/gal.dart';
@@ -45,6 +47,7 @@ jobs:
 
           // Home screen la ethu kaattanum nu inga maathalaam
           const homeQuery = 'trending videos today';
+          const fallbackId = 'dQw4w9WgXcQ';
 
           void main() => runApp(const MyApp());
 
@@ -70,13 +73,17 @@ jobs:
             List<yte.Video> _results = [];
             bool _loading = false;
             String _label = 'Trending';
-            String _curId = 'dQw4w9WgXcQ';
-            String _curTitle = 'Rick Astley - Never Gonna Give You Up';
+            String _curId = '';
+            String _curTitle = 'Trending video load aaguthu...';
             final Map<String, double> _progress = {};
+            final Set<String> _done = {};
+            bool _barVisible = true;
+            int _playSecs = 0;
+            Timer? _timer;
 
             late final YoutubePlayerController _controller =
                 YoutubePlayerController.fromVideoId(
-              videoId: 'dQw4w9WgXcQ',
+              videoId: fallbackId,
               autoPlay: false,
               params: const YoutubePlayerParams(
                 showFullscreenButton: true,
@@ -87,23 +94,74 @@ jobs:
             @override
             void initState() {
               super.initState();
-              _runSearch(homeQuery, quiet: true);
+              _loadDone();
+              _runSearch(homeQuery, quiet: true, cueFirst: true);
+              _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+                if (!mounted) return;
+                final playing = _controller.value.playerState == PlayerState.playing;
+                if (playing) {
+                  _playSecs++;
+                  if (_playSecs >= 5 && _barVisible) setState(() => _barVisible = false);
+                } else {
+                  _playSecs = 0;
+                  if (!_barVisible) setState(() => _barVisible = true);
+                }
+              });
+            }
+
+            Future<File> _doneFile() async {
+              final dir = await getApplicationDocumentsDirectory();
+              return File('${dir.path}/downloaded.json');
+            }
+
+            Future<void> _loadDone() async {
+              try {
+                final f = await _doneFile();
+                if (await f.exists()) {
+                  final list = jsonDecode(await f.readAsString()) as List;
+                  if (mounted) setState(() => _done.addAll(list.map((e) => e.toString())));
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _saveDone() async {
+              try {
+                final f = await _doneFile();
+                await f.writeAsString(jsonEncode(_done.toList()));
+              } catch (_) {}
             }
 
             void _msg(String m) {
               if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text(m)));
             }
 
-            Future<void> _runSearch(String q, {bool quiet = false}) async {
+            Future<void> _runSearch(String q,
+                {bool quiet = false, bool cueFirst = false}) async {
               setState(() => _loading = true);
               try {
                 final r = await _yt.search.search(q);
                 if (!mounted) return;
                 setState(() => _results = r.toList());
                 if (_results.isEmpty && !quiet) _msg('Onnum kedaikkala');
+                if (cueFirst && _results.isNotEmpty) {
+                  final first = _results.first;
+                  _controller.cueVideoById(videoId: first.id.value);
+                  setState(() {
+                    _curId = first.id.value;
+                    _curTitle = first.title;
+                  });
+                }
               } catch (e) {
                 if (!quiet) _msg('Search fail: internet check pannunga');
+                if (cueFirst && mounted) {
+                  setState(() {
+                    _curId = fallbackId;
+                    _curTitle = 'Rick Astley - Never Gonna Give You Up';
+                  });
+                }
               }
               if (mounted) setState(() => _loading = false);
             }
@@ -137,8 +195,56 @@ jobs:
               await _runSearch(q);
             }
 
-            Future<void> _download(String id, String title) async {
+            // Download button thattuna: quality list kaattum
+            Future<void> _onDownloadTap(String id) async {
+              if (id.isEmpty) return;
+              if (_done.contains(id)) {
+                _msg('Already download aagiduchu ✓');
+                return;
+              }
               if (_progress.containsKey(id)) return;
+              setState(() => _progress[id] = 0);
+              List<yte.MuxedStreamInfo> list;
+              try {
+                final manifest = await _yt.videos.streamsClient.getManifest(id);
+                list = manifest.muxed.toList()
+                  ..sort((a, b) =>
+                      b.videoResolution.height.compareTo(a.videoResolution.height));
+              } catch (e) {
+                _msg('Quality edukka mudiyala. Thirumba try pannunga');
+                if (mounted) setState(() => _progress.remove(id));
+                return;
+              }
+              if (mounted) setState(() => _progress.remove(id));
+              if (list.isEmpty || !mounted) {
+                _msg('Indha video download panna mudiyaadhu');
+                return;
+              }
+              final chosen = await showModalBottomSheet<yte.MuxedStreamInfo>(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text('Quality select pannunga',
+                          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                    ),
+                    for (final s in list)
+                      ListTile(
+                        leading: const Icon(Icons.high_quality),
+                        title: Text(s.videoQualityLabel),
+                        subtitle: Text(
+                            '${s.size.totalMegaBytes.toStringAsFixed(1)} MB  •  ${s.container.name}'),
+                        onTap: () => Navigator.pop(ctx, s),
+                      ),
+                  ]),
+                ),
+              );
+              if (chosen == null) return;
+              await _download(id, chosen);
+            }
+
+            Future<void> _download(String id, yte.MuxedStreamInfo info) async {
               setState(() => _progress[id] = 0);
               try {
                 final ok = await Gal.requestAccess();
@@ -148,8 +254,6 @@ jobs:
                   return;
                 }
                 _msg('Download aaguthu...');
-                final manifest = await _yt.videos.streamsClient.getManifest(id);
-                final info = manifest.muxed.withHighestBitrate();
                 final total = info.size.totalBytes;
                 final dir = await getTemporaryDirectory();
                 final file = File('${dir.path}/$id.mp4');
@@ -169,6 +273,8 @@ jobs:
                 await sink.close();
                 await Gal.putVideo(file.path, album: 'YT Downloads');
                 await file.delete();
+                _done.add(id);
+                await _saveDone();
                 _msg('Download mudinjadhu. Gallery la paarunga');
               } catch (e) {
                 _msg('Download fail aachu');
@@ -176,7 +282,7 @@ jobs:
               if (mounted) setState(() => _progress.remove(id));
             }
 
-            Widget _dlButton(String id, String title) {
+            Widget _dlButton(String id) {
               final p = _progress[id];
               if (p != null) {
                 return SizedBox(
@@ -189,15 +295,23 @@ jobs:
                   ),
                 );
               }
+              if (_done.contains(id)) {
+                return IconButton(
+                  tooltip: 'Downloaded',
+                  icon: const Icon(Icons.check_circle, color: Colors.green),
+                  onPressed: () => _onDownloadTap(id),
+                );
+              }
               return IconButton(
                 tooltip: 'Download',
                 icon: const Icon(Icons.download),
-                onPressed: () => _download(id, title),
+                onPressed: id.isEmpty ? null : () => _onDownloadTap(id),
               );
             }
 
             @override
             void dispose() {
+              _timer?.cancel();
               _controller.close();
               _yt.close();
               _text.dispose();
@@ -208,19 +322,26 @@ jobs:
             Widget build(BuildContext context) => Scaffold(
                   appBar: AppBar(title: const Text('YouTube Player')),
                   body: Column(children: [
+                    AnimatedOpacity(
+                      opacity: _barVisible ? 1 : 0,
+                      duration: const Duration(milliseconds: 400),
+                      child: IgnorePointer(
+                        ignoring: !_barVisible,
+                        child: Padding(
+                          padding: const EdgeInsets.only(left: 12),
+                          child: Row(children: [
+                            Expanded(
+                              child: Text(_curTitle,
+                                  maxLines: 1, overflow: TextOverflow.ellipsis),
+                            ),
+                            _dlButton(_curId),
+                          ]),
+                        ),
+                      ),
+                    ),
                     YoutubePlayer(controller: _controller, aspectRatio: 16 / 9),
                     Padding(
-                      padding: const EdgeInsets.only(left: 12),
-                      child: Row(children: [
-                        Expanded(
-                          child: Text(_curTitle,
-                              maxLines: 1, overflow: TextOverflow.ellipsis),
-                        ),
-                        _dlButton(_curId, _curTitle),
-                      ]),
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                       child: Row(children: [
                         Expanded(
                           child: TextField(
@@ -266,7 +387,7 @@ jobs:
                                 maxLines: 2, overflow: TextOverflow.ellipsis),
                             subtitle: Text(v.author,
                                 maxLines: 1, overflow: TextOverflow.ellipsis),
-                            trailing: _dlButton(v.id.value, v.title),
+                            trailing: _dlButton(v.id.value),
                             onTap: () => _play(v.id.value, v.title),
                           );
                         },
