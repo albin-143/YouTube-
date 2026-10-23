@@ -108,6 +108,10 @@ jobs:
             String _name = '';
             final _homeCtl = TextEditingController();
             final _nameCtl = TextEditingController();
+            final Map<String, Map<String, dynamic>> _active = {};
+            final Set<String> _cancelled = {};
+            int _activeCount = 0;
+            int _filesTab = 0;
 
             late final YoutubePlayerController _controller =
                 YoutubePlayerController.fromVideoId(
@@ -378,33 +382,149 @@ jobs:
               return s;
             }
 
-            Future<void> _fetch(
-                yte.StreamInfo s, File f, void Function(int) onBytes) async {
-              final sink = f.openWrite();
-              await for (final chunk in _yt.videos.streamsClient.get(s)) {
-                sink.add(chunk);
-                onBytes(chunk.length);
+            int _nid(String id) => (id.hashCode & 0x0fffffff) + 1000;
+
+            Future<void> _notify(
+                String id, String title, String text, int progress, bool ongoing) async {
+              try {
+                await _ch.invokeMethod('notify', {
+                  'id': _nid(id),
+                  'title': title,
+                  'text': text,
+                  'progress': progress,
+                  'ongoing': ongoing,
+                });
+              } catch (_) {}
+            }
+
+            Future<void> _svc(bool on) async {
+              try {
+                await _ch.invokeMethod('svc', {'on': on});
+              } catch (_) {}
+            }
+
+            // Veegama download: 6 connection sernthu (parallel). Fail aanaa pazhaya mura
+            Future<void> _fetchFast(
+                yte.StreamInfo s, File f, String id, void Function(int) onBytes) async {
+              final total = s.size.totalBytes;
+              const chunk = 2 * 1024 * 1024;
+              final n = (total + chunk - 1) ~/ chunk;
+              final client = HttpClient()
+                ..connectionTimeout = const Duration(seconds: 15);
+              final raf = await f.open(mode: FileMode.write);
+              var next = 0;
+              var failed = false;
+              Future<void> lock = Future.value();
+              Future<void> writeAt(int pos, List<int> data) {
+                final p = lock.then((_) async {
+                  await raf.setPosition(pos);
+                  await raf.writeFrom(data);
+                });
+                lock = p.catchError((_) {});
+                return p;
               }
-              await sink.flush();
-              await sink.close();
+
+              Future<void> worker() async {
+                try {
+                  while (!failed) {
+                    if (_cancelled.contains(id)) throw 'cancelled';
+                    final i = next++;
+                    if (i >= n) return;
+                    final start = i * chunk;
+                    final end =
+                        (start + chunk - 1 < total) ? start + chunk - 1 : total - 1;
+                    final req = await client.getUrl(s.url);
+                    req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+                    final res = await req.close();
+                    if (res.statusCode != 206) {
+                      await res.drain();
+                      throw 'http ${res.statusCode}';
+                    }
+                    final bb = BytesBuilder(copy: false);
+                    await for (final d in res) {
+                      bb.add(d);
+                      onBytes(d.length);
+                    }
+                    final data = bb.takeBytes();
+                    if (data.length != end - start + 1) throw 'short';
+                    await writeAt(start, data);
+                  }
+                } catch (e) {
+                  failed = true;
+                  rethrow;
+                }
+              }
+
+              try {
+                await Future.wait(List.generate(6, (_) => worker()));
+              } finally {
+                await lock;
+                await raf.close();
+                client.close(force: true);
+              }
+            }
+
+            Future<void> _fetch(yte.StreamInfo s, File f, String id,
+                void Function(int) onBytes) async {
+              var counted = 0;
+              void cnt(int n) {
+                counted += n;
+                onBytes(n);
+              }
+
+              try {
+                await _fetchFast(s, f, id, cnt);
+                return;
+              } catch (e) {
+                if (_cancelled.contains(id)) rethrow;
+                onBytes(-counted);
+                counted = 0;
+              }
+              final sink = f.openWrite();
+              try {
+                await for (final chunk in _yt.videos.streamsClient.get(s)) {
+                  if (_cancelled.contains(id)) throw 'cancelled';
+                  sink.add(chunk);
+                  onBytes(chunk.length);
+                }
+                await sink.flush();
+              } finally {
+                await sink.close();
+              }
             }
 
             Future<void> _download(String id, String title, _Opt o) async {
-              setState(() => _progress[id] = 0);
+              final q = o.label.split(' ').first;
+              setState(() {
+                _progress[id] = 0;
+                _active[id] = {'title': title, 'q': q, 'merging': false};
+                _cancelled.remove(id);
+              });
+              if (_activeCount++ == 0) _svc(true);
+              try {
+                await _ch.invokeMethod('askNotif');
+              } catch (_) {}
               final tmp = await getTemporaryDirectory();
               final temps = <File>[];
               try {
-                _msg('Download aaguthu...');
+                _msg('Download aaguthu... My Files la paarunga');
                 final ext = o.webm ? 'webm' : 'mp4';
                 final mime = o.webm ? 'video/webm' : 'video/mp4';
                 var got = 0;
                 var lastPct = -1;
+                var lastN = DateTime.fromMillisecondsSinceEpoch(0);
                 void tick(int n, int total) {
                   got += n;
-                  final pct = got * 100 ~/ total;
+                  final raw = got * 100 ~/ total;
+                  final pct = raw < 0 ? 0 : (raw > 100 ? 100 : raw);
                   if (pct != lastPct && mounted) {
                     lastPct = pct;
                     setState(() => _progress[id] = got / total);
+                  }
+                  final now = DateTime.now();
+                  if (now.difference(lastN).inMilliseconds > 800) {
+                    lastN = now;
+                    _notify(id, title, '$q  •  $pct%', pct, true);
                   }
                 }
 
@@ -413,16 +533,22 @@ jobs:
                   final total = o.muxed!.size.totalBytes;
                   out = File('${tmp.path}/$id.$ext');
                   temps.add(out);
-                  await _fetch(o.muxed!, out, (n) => tick(n, total));
+                  await _fetch(o.muxed!, out, id, (n) => tick(n, total));
                 } else {
                   final total = o.video!.size.totalBytes + o.audio!.size.totalBytes;
                   final vf = File('${tmp.path}/${id}_v');
                   final af = File('${tmp.path}/${id}_a');
                   out = File('${tmp.path}/${id}_out.$ext');
                   temps.addAll([vf, af, out]);
-                  await _fetch(o.video!, vf, (n) => tick(n, total));
-                  await _fetch(o.audio!, af, (n) => tick(n, total));
-                  if (mounted) setState(() => _progress[id] = 0); // merge aagumbothu spinner
+                  await _fetch(o.video!, vf, id, (n) => tick(n, total));
+                  await _fetch(o.audio!, af, id, (n) => tick(n, total));
+                  if (mounted) {
+                    setState(() {
+                      _progress[id] = 0;
+                      _active[id]?['merging'] = true;
+                    });
+                  }
+                  _notify(id, title, 'Merge aaguthu...', -1, true);
                   await _ch.invokeMethod('mux', {
                     'video': vf.path,
                     'audio': af.path,
@@ -432,26 +558,42 @@ jobs:
                 }
                 final uri = await _ch.invokeMethod<String>('save', {
                   'path': out.path,
-                  'name': '${_safe(title, id)} [${o.label.split(' ').first}].$ext',
+                  'name': '${_safe(title, id)} [$q].$ext',
                   'mime': mime,
                 });
                 _done[id] = {
                   'uri': uri ?? '',
                   'mime': mime,
                   'title': title,
-                  'q': o.label.split(' ').first,
+                  'q': q,
                 };
                 await _saveDone();
+                _notify(id, title, 'Download mudinjadhu ✓', 100, false);
                 _msg('Download mudinjadhu: Download > ABH YouTube folder');
               } catch (e) {
-                _msg('Download fail aachu');
+                if (_cancelled.contains(id)) {
+                  _msg('Download cancel aachu');
+                  try {
+                    await _ch.invokeMethod('cancelNotif', {'id': _nid(id)});
+                  } catch (_) {}
+                } else {
+                  _msg('Download fail aachu');
+                  _notify(id, title, 'Download fail aachu', 100, false);
+                }
               }
               for (final f in temps) {
                 try {
                   if (await f.exists()) await f.delete();
                 } catch (_) {}
               }
-              if (mounted) setState(() => _progress.remove(id));
+              if (mounted) {
+                setState(() {
+                  _progress.remove(id);
+                  _active.remove(id);
+                });
+              }
+              _cancelled.remove(id);
+              if (--_activeCount == 0) _svc(false);
             }
 
             Future<void> _openDone(String id) async {
@@ -632,7 +774,75 @@ jobs:
               _runSearch(_homeQ, quiet: true);
             }
 
-            Widget _files() {
+            Widget _files() => Column(children: [
+                  Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: SegmentedButton<int>(
+                      segments: [
+                        ButtonSegment(
+                            value: 0,
+                            icon: const Icon(Icons.downloading),
+                            label: Text('Downloading (${_active.length})')),
+                        ButtonSegment(
+                            value: 1,
+                            icon: const Icon(Icons.download_done),
+                            label: Text('Downloaded (${_done.length})')),
+                      ],
+                      selected: {_filesTab},
+                      onSelectionChanged: (v) => setState(() => _filesTab = v.first),
+                    ),
+                  ),
+                  Expanded(
+                      child: _filesTab == 0 ? _downloadingList() : _downloadedList()),
+                ]);
+
+            Widget _downloadingList() {
+              final items = _active.entries.toList();
+              if (items.isEmpty) {
+                return const Center(child: Text('Ippo download edhuvum nadakkala'));
+              }
+              return ListView.builder(
+                itemCount: items.length,
+                itemBuilder: (context, i) {
+                  final id = items[i].key;
+                  final d = items[i].value;
+                  final p = _progress[id] ?? 0.0;
+                  final merging = d['merging'] == true;
+                  return ListTile(
+                    leading: Image.network(
+                      'https://img.youtube.com/vi/$id/mqdefault.jpg',
+                      width: 80,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const SizedBox(width: 80, child: Icon(Icons.movie)),
+                    ),
+                    title: Text(d['title'] as String,
+                        maxLines: 2, overflow: TextOverflow.ellipsis),
+                    subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const SizedBox(height: 6),
+                          LinearProgressIndicator(
+                              value: (p > 0 && !merging) ? p : null),
+                          const SizedBox(height: 4),
+                          Text(merging
+                              ? 'Merge aaguthu...'
+                              : '${d['q']}  •  ${(p * 100).round()}%'),
+                        ]),
+                    trailing: IconButton(
+                      tooltip: 'Cancel',
+                      icon: const Icon(Icons.close),
+                      onPressed: () {
+                        _cancelled.add(id);
+                        _msg('Cancel panren...');
+                      },
+                    ),
+                  );
+                },
+              );
+            }
+
+            Widget _downloadedList() {
               final items = _done.entries.toList().reversed.toList();
               if (items.isEmpty) {
                 return const Center(child: Text('Innum download onnum illa'));
@@ -794,11 +1004,18 @@ jobs:
       - name: Write native code
         run: |
           F=$(find android/app/src/main -name MainActivity.kt | head -n 1)
+          D=$(dirname "$F")
           PKG=$(grep -m1 '^package' "$F")
           echo "$PKG" > "$F"
           cat >> "$F" <<'KOT'
 
+          import android.Manifest
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
           import android.content.ContentValues
+          import android.content.pm.PackageManager
           import android.content.Intent
           import android.media.MediaCodec
           import android.media.MediaExtractor
@@ -860,9 +1077,70 @@ jobs:
                               } catch (e: Exception) {
                                   result.error("open", e.toString(), null)
                               }
+                              "notify" -> {
+                                  notifyDl(
+                                      call.argument<Int>("id")!!,
+                                      call.argument<String>("title")!!,
+                                      call.argument<String>("text")!!,
+                                      call.argument<Int>("progress")!!,
+                                      call.argument<Boolean>("ongoing")!!
+                                  )
+                                  result.success(true)
+                              }
+                              "cancelNotif" -> {
+                                  nm().cancel(call.argument<Int>("id")!!)
+                                  result.success(true)
+                              }
+                              "askNotif" -> {
+                                  if (Build.VERSION.SDK_INT >= 33 &&
+                                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                                  ) {
+                                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 11)
+                                  }
+                                  result.success(true)
+                              }
+                              "svc" -> {
+                                  val i = Intent(this, DlService::class.java)
+                                  if (call.argument<Boolean>("on") == true) {
+                                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
+                                  } else {
+                                      stopService(i)
+                                  }
+                                  result.success(true)
+                              }
                               else -> result.notImplemented()
                           }
                       }
+              }
+
+              private fun nm() = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+              private fun notifyDl(id: Int, title: String, text: String, progress: Int, ongoing: Boolean) {
+                  val m = nm()
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      m.createNotificationChannel(
+                          NotificationChannel("dl", "Downloads", NotificationManager.IMPORTANCE_LOW)
+                      )
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "dl")
+                  else Notification.Builder(this)
+                  b.setContentTitle(title)
+                  b.setContentText(text)
+                  b.setSmallIcon(
+                      if (ongoing) android.R.drawable.stat_sys_download
+                      else android.R.drawable.stat_sys_download_done
+                  )
+                  b.setOngoing(ongoing)
+                  b.setOnlyAlertOnce(true)
+                  b.setAutoCancel(!ongoing)
+                  if (ongoing) b.setProgress(100, if (progress < 0) 0 else progress, progress < 0)
+                  val pi = PendingIntent.getActivity(
+                      this, 0,
+                      Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  b.setContentIntent(pi)
+                  m.notify(id, b.build())
               }
 
               private fun pick(path: String, prefix: String): Pair<MediaExtractor, Int> {
@@ -943,10 +1221,48 @@ jobs:
               }
           }
           KOT
+          echo "$PKG" > "$D/DlService.kt"
+          cat >> "$D/DlService.kt" <<'SVC'
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          class DlService : Service() {
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val m = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      m.createNotificationChannel(
+                          NotificationChannel("svc", "Background", NotificationManager.IMPORTANCE_MIN)
+                      )
+                  }
+                  val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "svc")
+                  else Notification.Builder(this)
+                  b.setContentTitle("ABH YouTube")
+                  b.setContentText("Download nadakkuthu")
+                  b.setSmallIcon(android.R.drawable.stat_sys_download)
+                  b.setOngoing(true)
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(777, b.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  } else {
+                      startForeground(777, b.build())
+                  }
+                  return START_NOT_STICKY
+              }
+          }
+          SVC
       - name: Manifest changes
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n    <application#' $M
+          sed -i 's#</application>#    <service android:name=".DlService" android:foregroundServiceType="dataSync" android:exported="false"/>\n    </application>#' $M
           sed -i 's#android:label="[^"]*"#android:label="ABH YouTube"#' $M
       - run: flutter pub get
       - run: flutter build apk --release
