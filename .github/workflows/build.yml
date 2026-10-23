@@ -211,7 +211,7 @@ jobs:
               await _runSearch(q);
             }
 
-            String _lbl(int h, double fps) {
+            String _lbl(int h, num fps) {
               var s = fps > 30 ? '${h}p${fps.round()}' : '${h}p';
               if (h >= 2160) {
                 s += '  (4K)';
@@ -539,156 +539,154 @@ jobs:
         run: |
           F=$(find android/app/src/main -name MainActivity.kt | head -n 1)
           PKG=$(grep -m1 '^package' "$F")
-          {
-            echo "$PKG"
-            cat <<'KOT'
+          echo "$PKG" > "$F"
+          cat >> "$F" <<'KOT'
 
-            import android.content.ContentValues
-            import android.content.Intent
-            import android.media.MediaCodec
-            import android.media.MediaExtractor
-            import android.media.MediaFormat
-            import android.media.MediaMuxer
-            import android.net.Uri
-            import android.os.Build
-            import android.os.Environment
-            import android.os.Handler
-            import android.os.Looper
-            import android.provider.MediaStore
-            import io.flutter.embedding.android.FlutterActivity
-            import io.flutter.embedding.engine.FlutterEngine
-            import io.flutter.plugin.common.MethodChannel
-            import java.io.File
-            import java.nio.ByteBuffer
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.nio.ByteBuffer
 
-            class MainActivity : FlutterActivity() {
-                override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-                    super.configureFlutterEngine(flutterEngine)
-                    val main = Handler(Looper.getMainLooper())
-                    MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "abh/media")
-                        .setMethodCallHandler { call, result ->
-                            when (call.method) {
-                                "mux" -> Thread {
-                                    try {
-                                        mux(
-                                            call.argument<String>("video")!!,
-                                            call.argument<String>("audio")!!,
-                                            call.argument<String>("out")!!,
-                                            call.argument<Boolean>("webm") ?: false
-                                        )
-                                        main.post { result.success(true) }
-                                    } catch (e: Exception) {
-                                        main.post { result.error("mux", e.toString(), null) }
-                                    }
-                                }.start()
-                                "save" -> Thread {
-                                    try {
-                                        val uri = save(
-                                            call.argument<String>("path")!!,
-                                            call.argument<String>("name")!!,
-                                            call.argument<String>("mime")!!
-                                        )
-                                        main.post { result.success(uri) }
-                                    } catch (e: Exception) {
-                                        main.post { result.error("save", e.toString(), null) }
-                                    }
-                                }.start()
-                                "open" -> try {
-                                    val i = Intent(Intent.ACTION_VIEW)
-                                    i.setDataAndType(
-                                        Uri.parse(call.argument<String>("uri")),
-                                        call.argument<String>("mime")
-                                    )
-                                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    startActivity(i)
-                                    result.success(true)
-                                } catch (e: Exception) {
-                                    result.error("open", e.toString(), null)
-                                }
-                                else -> result.notImplemented()
-                            }
-                        }
-                }
+          class MainActivity : FlutterActivity() {
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val main = Handler(Looper.getMainLooper())
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "abh/media")
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "mux" -> Thread {
+                                  try {
+                                      mux(
+                                          call.argument<String>("video")!!,
+                                          call.argument<String>("audio")!!,
+                                          call.argument<String>("out")!!,
+                                          call.argument<Boolean>("webm") ?: false
+                                      )
+                                      main.post { result.success(true) }
+                                  } catch (e: Exception) {
+                                      main.post { result.error("mux", e.toString(), null) }
+                                  }
+                              }.start()
+                              "save" -> Thread {
+                                  try {
+                                      val uri = save(
+                                          call.argument<String>("path")!!,
+                                          call.argument<String>("name")!!,
+                                          call.argument<String>("mime")!!
+                                      )
+                                      main.post { result.success(uri) }
+                                  } catch (e: Exception) {
+                                      main.post { result.error("save", e.toString(), null) }
+                                  }
+                              }.start()
+                              "open" -> try {
+                                  val i = Intent(Intent.ACTION_VIEW)
+                                  i.setDataAndType(
+                                      Uri.parse(call.argument<String>("uri")),
+                                      call.argument<String>("mime")
+                                  )
+                                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                                  startActivity(i)
+                                  result.success(true)
+                              } catch (e: Exception) {
+                                  result.error("open", e.toString(), null)
+                              }
+                              else -> result.notImplemented()
+                          }
+                      }
+              }
 
-                private fun pick(path: String, prefix: String): Pair<MediaExtractor, Int> {
-                    val ex = MediaExtractor()
-                    ex.setDataSource(path)
-                    for (i in 0 until ex.trackCount) {
-                        val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
-                        if (mime.startsWith(prefix)) {
-                            ex.selectTrack(i)
-                            return Pair(ex, i)
-                        }
-                    }
-                    throw Exception("no $prefix track")
-                }
+              private fun pick(path: String, prefix: String): Pair<MediaExtractor, Int> {
+                  val ex = MediaExtractor()
+                  ex.setDataSource(path)
+                  for (i in 0 until ex.trackCount) {
+                      val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                      if (mime.startsWith(prefix)) {
+                          ex.selectTrack(i)
+                          return Pair(ex, i)
+                      }
+                  }
+                  throw Exception("no $prefix track")
+              }
 
-                private fun mux(video: String, audio: String, out: String, webm: Boolean) {
-                    val (vEx, vi) = pick(video, "video/")
-                    val (aEx, ai) = pick(audio, "audio/")
-                    val fmt = if (webm) MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
-                    else MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
-                    val muxer = MediaMuxer(out, fmt)
-                    val vt = muxer.addTrack(vEx.getTrackFormat(vi))
-                    val at = muxer.addTrack(aEx.getTrackFormat(ai))
-                    muxer.start()
-                    val buf = ByteBuffer.allocate(8 * 1024 * 1024)
-                    val info = MediaCodec.BufferInfo()
-                    var vDone = false
-                    var aDone = false
-                    while (!(vDone && aDone)) {
-                        val useV = !vDone && (aDone || vEx.sampleTime <= aEx.sampleTime)
-                        val ex = if (useV) vEx else aEx
-                        val tr = if (useV) vt else at
-                        val size = ex.readSampleData(buf, 0)
-                        if (size < 0) {
-                            if (useV) vDone = true else aDone = true
-                            continue
-                        }
-                        info.set(0, size, ex.sampleTime, ex.sampleFlags)
-                        muxer.writeSampleData(tr, buf, info)
-                        ex.advance()
-                    }
-                    muxer.stop()
-                    muxer.release()
-                    vEx.release()
-                    aEx.release()
-                }
+              private fun mux(video: String, audio: String, out: String, webm: Boolean) {
+                  val (vEx, vi) = pick(video, "video/")
+                  val (aEx, ai) = pick(audio, "audio/")
+                  val fmt = if (webm) MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+                  else MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+                  val muxer = MediaMuxer(out, fmt)
+                  val vt = muxer.addTrack(vEx.getTrackFormat(vi))
+                  val at = muxer.addTrack(aEx.getTrackFormat(ai))
+                  muxer.start()
+                  val buf = ByteBuffer.allocate(8 * 1024 * 1024)
+                  val info = MediaCodec.BufferInfo()
+                  var vDone = false
+                  var aDone = false
+                  while (!(vDone && aDone)) {
+                      val useV = !vDone && (aDone || vEx.sampleTime <= aEx.sampleTime)
+                      val ex = if (useV) vEx else aEx
+                      val tr = if (useV) vt else at
+                      val size = ex.readSampleData(buf, 0)
+                      if (size < 0) {
+                          if (useV) vDone = true else aDone = true
+                          continue
+                      }
+                      info.set(0, size, ex.sampleTime, ex.sampleFlags)
+                      muxer.writeSampleData(tr, buf, info)
+                      ex.advance()
+                  }
+                  muxer.stop()
+                  muxer.release()
+                  vEx.release()
+                  aEx.release()
+              }
 
-                private fun save(path: String, name: String, mime: String): String {
-                    val src = File(path)
-                    val resultUri: String
-                    if (Build.VERSION.SDK_INT >= 29) {
-                        val v = ContentValues()
-                        v.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-                        v.put(MediaStore.MediaColumns.MIME_TYPE, mime)
-                        v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/ABH YouTube")
-                        v.put(MediaStore.MediaColumns.IS_PENDING, 1)
-                        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
-                            ?: throw Exception("insert failed")
-                        contentResolver.openOutputStream(uri)!!.use { o ->
-                            src.inputStream().use { it.copyTo(o, 1 shl 20) }
-                        }
-                        v.clear()
-                        v.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        contentResolver.update(uri, v, null, null)
-                        resultUri = uri.toString()
-                    } else {
-                        val dir = File(
-                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                            "ABH YouTube"
-                        )
-                        dir.mkdirs()
-                        val dst = File(dir, name)
-                        src.copyTo(dst, true)
-                        resultUri = Uri.fromFile(dst).toString()
-                    }
-                    src.delete()
-                    return resultUri
-                }
-            }
-            KOT
-          } > "$F"
+              private fun save(path: String, name: String, mime: String): String {
+                  val src = File(path)
+                  val resultUri: String
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      val v = ContentValues()
+                      v.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                      v.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                      v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/ABH YouTube")
+                      v.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
+                          ?: throw Exception("insert failed")
+                      contentResolver.openOutputStream(uri)!!.use { o ->
+                          src.inputStream().use { it.copyTo(o, 1 shl 20) }
+                      }
+                      v.clear()
+                      v.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                      contentResolver.update(uri, v, null, null)
+                      resultUri = uri.toString()
+                  } else {
+                      val dir = File(
+                          Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                          "ABH YouTube"
+                      )
+                      dir.mkdirs()
+                      val dst = File(dir, name)
+                      src.copyTo(dst, true)
+                      resultUri = Uri.fromFile(dst).toString()
+                  }
+                  src.delete()
+                  return resultUri
+              }
+          }
+          KOT
       - name: Manifest changes
         run: |
           M=android/app/src/main/AndroidManifest.xml
