@@ -1,4 +1,4 @@
-name: Build APK
+name: Build ABH YouTube APK
 on:
   push:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
         run: |
           cat > pubspec.yaml <<'EOF'
           name: youtube_app
-          description: YouTube search, play and download
+          description: ABH YouTube
           publish_to: none
           version: 1.0.0+1
           environment:
@@ -30,7 +30,6 @@ jobs:
               sdk: flutter
             youtube_player_iframe: ^5.2.1
             youtube_explode_dart: ^2.3.0
-            gal: ^2.3.0
             path_provider: ^2.1.0
           flutter:
             uses-material-design: true
@@ -40,7 +39,7 @@ jobs:
           import 'dart:convert';
           import 'dart:io';
           import 'package:flutter/material.dart';
-          import 'package:gal/gal.dart';
+          import 'package:flutter/services.dart';
           import 'package:path_provider/path_provider.dart';
           import 'package:youtube_player_iframe/youtube_player_iframe.dart';
           import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yte;
@@ -48,6 +47,8 @@ jobs:
           // Home screen la ethu kaattanum nu inga maathalaam
           const homeQuery = 'trending videos today';
           const fallbackId = 'dQw4w9WgXcQ';
+          const appName = 'ABH YouTube';
+          const _ch = MethodChannel('abh/media');
 
           void main() => runApp(const MyApp());
 
@@ -55,10 +56,22 @@ jobs:
             const MyApp({super.key});
             @override
             Widget build(BuildContext context) => MaterialApp(
-                  title: 'YouTube Player',
+                  title: appName,
                   theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
                   home: const PlayerPage(),
                 );
+          }
+
+          class _Opt {
+            final int h;
+            final String label;
+            final double mb;
+            final yte.MuxedStreamInfo? muxed;
+            final yte.VideoOnlyStreamInfo? video;
+            final yte.AudioOnlyStreamInfo? audio;
+            final bool webm;
+            _Opt(this.h, this.label, this.mb,
+                {this.muxed, this.video, this.audio, this.webm = false});
           }
 
           class PlayerPage extends StatefulWidget {
@@ -76,7 +89,7 @@ jobs:
             String _curId = '';
             String _curTitle = 'Trending video load aaguthu...';
             final Map<String, double> _progress = {};
-            final Set<String> _done = {};
+            final Map<String, Map<String, dynamic>> _done = {};
             bool _barVisible = true;
             int _playSecs = 0;
             Timer? _timer;
@@ -111,15 +124,18 @@ jobs:
 
             Future<File> _doneFile() async {
               final dir = await getApplicationDocumentsDirectory();
-              return File('${dir.path}/downloaded.json');
+              return File('${dir.path}/downloaded2.json');
             }
 
             Future<void> _loadDone() async {
               try {
                 final f = await _doneFile();
                 if (await f.exists()) {
-                  final list = jsonDecode(await f.readAsString()) as List;
-                  if (mounted) setState(() => _done.addAll(list.map((e) => e.toString())));
+                  final m = jsonDecode(await f.readAsString()) as Map;
+                  if (mounted) {
+                    setState(() => m.forEach(
+                        (k, v) => _done[k.toString()] = Map<String, dynamic>.from(v)));
+                  }
                 }
               } catch (_) {}
             }
@@ -127,7 +143,7 @@ jobs:
             Future<void> _saveDone() async {
               try {
                 final f = await _doneFile();
-                await f.writeAsString(jsonEncode(_done.toList()));
+                await f.writeAsString(jsonEncode(_done));
               } catch (_) {}
             }
 
@@ -195,33 +211,91 @@ jobs:
               await _runSearch(q);
             }
 
-            // Download button thattuna: quality list kaattum
-            Future<void> _onDownloadTap(String id) async {
+            String _lbl(int h, double fps) {
+              var s = fps > 30 ? '${h}p${fps.round()}' : '${h}p';
+              if (h >= 2160) {
+                s += '  (4K)';
+              } else if (h >= 1440) {
+                s += '  (2K)';
+              } else if (h >= 1080) {
+                s += '  (HD)';
+              }
+              return s;
+            }
+
+            List<_Opt> _buildOpts(yte.StreamManifest m) {
+              final opts = <_Opt>[];
+              final muxedH = <int>{};
+              for (final s in m.muxed) {
+                final c = s.container.name;
+                if (c != 'mp4' && c != 'webm') continue;
+                final h = s.videoResolution.height;
+                muxedH.add(h);
+                opts.add(_Opt(h, _lbl(h, s.framerate.framesPerSecond),
+                    s.size.totalMegaBytes,
+                    muxed: s, webm: c == 'webm'));
+              }
+              double score(yte.VideoOnlyStreamInfo v) =>
+                  (v.videoCodec.toLowerCase().startsWith('avc') ? 1e12 : 0) +
+                  v.bitrate.bitsPerSecond.toDouble();
+              final best = <int, yte.VideoOnlyStreamInfo>{};
+              for (final v in m.videoOnly) {
+                final h = v.videoResolution.height;
+                if (muxedH.contains(h)) continue;
+                final c = v.container.name;
+                final codec = v.videoCodec.toLowerCase();
+                final ok = (c == 'mp4' && codec.startsWith('avc')) ||
+                    (c == 'webm' && !codec.startsWith('av01'));
+                if (!ok) continue;
+                final cur = best[h];
+                if (cur == null || score(v) > score(cur)) best[h] = v;
+              }
+              for (final e in best.entries) {
+                final v = e.value;
+                final webm = v.container.name == 'webm';
+                final auds = m.audioOnly
+                    .where((a) => a.container.name == (webm ? 'webm' : 'mp4'))
+                    .toList()
+                  ..sort((a, b) =>
+                      b.bitrate.bitsPerSecond.compareTo(a.bitrate.bitsPerSecond));
+                if (auds.isEmpty) continue;
+                opts.add(_Opt(
+                    e.key,
+                    _lbl(e.key, v.framerate.framesPerSecond),
+                    v.size.totalMegaBytes + auds.first.size.totalMegaBytes,
+                    video: v,
+                    audio: auds.first,
+                    webm: webm));
+              }
+              opts.sort((a, b) => b.h.compareTo(a.h));
+              return opts;
+            }
+
+            Future<void> _onDownloadTap(String id, String title) async {
               if (id.isEmpty) return;
-              if (_done.contains(id)) {
+              if (_done.containsKey(id)) {
                 _msg('Already download aagiduchu ✓');
                 return;
               }
               if (_progress.containsKey(id)) return;
               setState(() => _progress[id] = 0);
-              List<yte.MuxedStreamInfo> list;
+              List<_Opt> opts;
               try {
                 final manifest = await _yt.videos.streamsClient.getManifest(id);
-                list = manifest.muxed.toList()
-                  ..sort((a, b) =>
-                      b.videoResolution.height.compareTo(a.videoResolution.height));
+                opts = _buildOpts(manifest);
               } catch (e) {
                 _msg('Quality edukka mudiyala. Thirumba try pannunga');
                 if (mounted) setState(() => _progress.remove(id));
                 return;
               }
               if (mounted) setState(() => _progress.remove(id));
-              if (list.isEmpty || !mounted) {
+              if (opts.isEmpty || !mounted) {
                 _msg('Indha video download panna mudiyaadhu');
                 return;
               }
-              final chosen = await showModalBottomSheet<yte.MuxedStreamInfo>(
+              final chosen = await showModalBottomSheet<_Opt>(
                 context: context,
+                isScrollControlled: true,
                 builder: (ctx) => SafeArea(
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
                     const Padding(
@@ -229,60 +303,117 @@ jobs:
                       child: Text('Quality select pannunga',
                           style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                     ),
-                    for (final s in list)
-                      ListTile(
-                        leading: const Icon(Icons.high_quality),
-                        title: Text(s.videoQualityLabel),
-                        subtitle: Text(
-                            '${s.size.totalMegaBytes.toStringAsFixed(1)} MB  •  ${s.container.name}'),
-                        onTap: () => Navigator.pop(ctx, s),
-                      ),
+                    Flexible(
+                      child: ListView(shrinkWrap: true, children: [
+                        for (final o in opts)
+                          ListTile(
+                            leading: const Icon(Icons.high_quality),
+                            title: Text(o.label),
+                            subtitle: Text(
+                                '${o.mb.toStringAsFixed(1)} MB  •  ${o.webm ? 'webm' : 'mp4'}'),
+                            onTap: () => Navigator.pop(ctx, o),
+                          ),
+                      ]),
+                    ),
                   ]),
                 ),
               );
               if (chosen == null) return;
-              await _download(id, chosen);
+              await _download(id, title, chosen);
             }
 
-            Future<void> _download(String id, yte.MuxedStreamInfo info) async {
+            String _safe(String t, String id) {
+              var s = t.replaceAll(RegExp(r'[\\/:*?"<>|\n\r]'), '').trim();
+              if (s.isEmpty) s = id;
+              if (s.length > 80) s = s.substring(0, 80);
+              return s;
+            }
+
+            Future<void> _fetch(
+                yte.StreamInfo s, File f, void Function(int) onBytes) async {
+              final sink = f.openWrite();
+              await for (final chunk in _yt.videos.streamsClient.get(s)) {
+                sink.add(chunk);
+                onBytes(chunk.length);
+              }
+              await sink.flush();
+              await sink.close();
+            }
+
+            Future<void> _download(String id, String title, _Opt o) async {
               setState(() => _progress[id] = 0);
+              final tmp = await getTemporaryDirectory();
+              final temps = <File>[];
               try {
-                final ok = await Gal.requestAccess();
-                if (!ok) {
-                  _msg('Storage permission venum');
-                  if (mounted) setState(() => _progress.remove(id));
-                  return;
-                }
                 _msg('Download aaguthu...');
-                final total = info.size.totalBytes;
-                final dir = await getTemporaryDirectory();
-                final file = File('${dir.path}/$id.mp4');
-                final sink = file.openWrite();
+                final ext = o.webm ? 'webm' : 'mp4';
+                final mime = o.webm ? 'video/webm' : 'video/mp4';
                 var got = 0;
                 var lastPct = -1;
-                await for (final chunk in _yt.videos.streamsClient.get(info)) {
-                  got += chunk.length;
-                  sink.add(chunk);
-                  final pct = (got * 100 ~/ total);
+                void tick(int n, int total) {
+                  got += n;
+                  final pct = got * 100 ~/ total;
                   if (pct != lastPct && mounted) {
                     lastPct = pct;
                     setState(() => _progress[id] = got / total);
                   }
                 }
-                await sink.flush();
-                await sink.close();
-                await Gal.putVideo(file.path, album: 'YT Downloads');
-                await file.delete();
-                _done.add(id);
+
+                late File out;
+                if (o.muxed != null) {
+                  final total = o.muxed!.size.totalBytes;
+                  out = File('${tmp.path}/$id.$ext');
+                  temps.add(out);
+                  await _fetch(o.muxed!, out, (n) => tick(n, total));
+                } else {
+                  final total = o.video!.size.totalBytes + o.audio!.size.totalBytes;
+                  final vf = File('${tmp.path}/${id}_v');
+                  final af = File('${tmp.path}/${id}_a');
+                  out = File('${tmp.path}/${id}_out.$ext');
+                  temps.addAll([vf, af, out]);
+                  await _fetch(o.video!, vf, (n) => tick(n, total));
+                  await _fetch(o.audio!, af, (n) => tick(n, total));
+                  if (mounted) setState(() => _progress[id] = 0); // merge aagumbothu spinner
+                  await _ch.invokeMethod('mux', {
+                    'video': vf.path,
+                    'audio': af.path,
+                    'out': out.path,
+                    'webm': o.webm,
+                  });
+                }
+                final uri = await _ch.invokeMethod<String>('save', {
+                  'path': out.path,
+                  'name': '${_safe(title, id)} [${o.label.split(' ').first}].$ext',
+                  'mime': mime,
+                });
+                _done[id] = {'uri': uri ?? '', 'mime': mime};
                 await _saveDone();
-                _msg('Download mudinjadhu. Gallery la paarunga');
+                _msg('Download mudinjadhu: Download > ABH YouTube folder');
               } catch (e) {
                 _msg('Download fail aachu');
+              }
+              for (final f in temps) {
+                try {
+                  if (await f.exists()) await f.delete();
+                } catch (_) {}
               }
               if (mounted) setState(() => _progress.remove(id));
             }
 
-            Widget _dlButton(String id) {
+            Future<void> _openDone(String id) async {
+              final d = _done[id];
+              if (d == null || (d['uri'] as String).isEmpty) {
+                _msg('Download > ABH YouTube folder la paarunga');
+                return;
+              }
+              try {
+                await _ch.invokeMethod('open', {'uri': d['uri'], 'mime': d['mime']});
+              } catch (e) {
+                _msg('Video open panna mudiyala (file delete aagirukkalaam)');
+              }
+            }
+
+            Widget _dlButton(String id, String title) {
               final p = _progress[id];
               if (p != null) {
                 return SizedBox(
@@ -295,17 +426,24 @@ jobs:
                   ),
                 );
               }
-              if (_done.contains(id)) {
-                return IconButton(
-                  tooltip: 'Downloaded',
-                  icon: const Icon(Icons.check_circle, color: Colors.green),
-                  onPressed: () => _onDownloadTap(id),
-                );
+              if (_done.containsKey(id)) {
+                return Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(
+                    tooltip: 'Paarkka',
+                    icon: const Icon(Icons.visibility),
+                    onPressed: () => _openDone(id),
+                  ),
+                  IconButton(
+                    tooltip: 'Downloaded',
+                    icon: const Icon(Icons.check_circle, color: Colors.green),
+                    onPressed: () => _onDownloadTap(id, title),
+                  ),
+                ]);
               }
               return IconButton(
                 tooltip: 'Download',
                 icon: const Icon(Icons.download),
-                onPressed: id.isEmpty ? null : () => _onDownloadTap(id),
+                onPressed: id.isEmpty ? null : () => _onDownloadTap(id, title),
               );
             }
 
@@ -320,7 +458,7 @@ jobs:
 
             @override
             Widget build(BuildContext context) => Scaffold(
-                  appBar: AppBar(title: const Text('YouTube Player')),
+                  appBar: AppBar(title: const Text(appName)),
                   body: Column(children: [
                     AnimatedOpacity(
                       opacity: _barVisible ? 1 : 0,
@@ -334,7 +472,7 @@ jobs:
                               child: Text(_curTitle,
                                   maxLines: 1, overflow: TextOverflow.ellipsis),
                             ),
-                            _dlButton(_curId),
+                            _dlButton(_curId, _curTitle),
                           ]),
                         ),
                       ),
@@ -387,7 +525,7 @@ jobs:
                                 maxLines: 2, overflow: TextOverflow.ellipsis),
                             subtitle: Text(v.author,
                                 maxLines: 1, overflow: TextOverflow.ellipsis),
-                            trailing: _dlButton(v.id.value),
+                            trailing: _dlButton(v.id.value, v.title),
                             onTap: () => _play(v.id.value, v.title),
                           );
                         },
@@ -397,11 +535,168 @@ jobs:
                 );
           }
           EOF
-      - name: Add internet permission
-        run: sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+      - name: Write native code
+        run: |
+          F=$(find android/app/src/main -name MainActivity.kt | head -n 1)
+          PKG=$(grep -m1 '^package' "$F")
+          {
+            echo "$PKG"
+            cat <<'KOT'
+
+            import android.content.ContentValues
+            import android.content.Intent
+            import android.media.MediaCodec
+            import android.media.MediaExtractor
+            import android.media.MediaFormat
+            import android.media.MediaMuxer
+            import android.net.Uri
+            import android.os.Build
+            import android.os.Environment
+            import android.os.Handler
+            import android.os.Looper
+            import android.provider.MediaStore
+            import io.flutter.embedding.android.FlutterActivity
+            import io.flutter.embedding.engine.FlutterEngine
+            import io.flutter.plugin.common.MethodChannel
+            import java.io.File
+            import java.nio.ByteBuffer
+
+            class MainActivity : FlutterActivity() {
+                override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                    super.configureFlutterEngine(flutterEngine)
+                    val main = Handler(Looper.getMainLooper())
+                    MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "abh/media")
+                        .setMethodCallHandler { call, result ->
+                            when (call.method) {
+                                "mux" -> Thread {
+                                    try {
+                                        mux(
+                                            call.argument<String>("video")!!,
+                                            call.argument<String>("audio")!!,
+                                            call.argument<String>("out")!!,
+                                            call.argument<Boolean>("webm") ?: false
+                                        )
+                                        main.post { result.success(true) }
+                                    } catch (e: Exception) {
+                                        main.post { result.error("mux", e.toString(), null) }
+                                    }
+                                }.start()
+                                "save" -> Thread {
+                                    try {
+                                        val uri = save(
+                                            call.argument<String>("path")!!,
+                                            call.argument<String>("name")!!,
+                                            call.argument<String>("mime")!!
+                                        )
+                                        main.post { result.success(uri) }
+                                    } catch (e: Exception) {
+                                        main.post { result.error("save", e.toString(), null) }
+                                    }
+                                }.start()
+                                "open" -> try {
+                                    val i = Intent(Intent.ACTION_VIEW)
+                                    i.setDataAndType(
+                                        Uri.parse(call.argument<String>("uri")),
+                                        call.argument<String>("mime")
+                                    )
+                                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(i)
+                                    result.success(true)
+                                } catch (e: Exception) {
+                                    result.error("open", e.toString(), null)
+                                }
+                                else -> result.notImplemented()
+                            }
+                        }
+                }
+
+                private fun pick(path: String, prefix: String): Pair<MediaExtractor, Int> {
+                    val ex = MediaExtractor()
+                    ex.setDataSource(path)
+                    for (i in 0 until ex.trackCount) {
+                        val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: ""
+                        if (mime.startsWith(prefix)) {
+                            ex.selectTrack(i)
+                            return Pair(ex, i)
+                        }
+                    }
+                    throw Exception("no $prefix track")
+                }
+
+                private fun mux(video: String, audio: String, out: String, webm: Boolean) {
+                    val (vEx, vi) = pick(video, "video/")
+                    val (aEx, ai) = pick(audio, "audio/")
+                    val fmt = if (webm) MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+                    else MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+                    val muxer = MediaMuxer(out, fmt)
+                    val vt = muxer.addTrack(vEx.getTrackFormat(vi))
+                    val at = muxer.addTrack(aEx.getTrackFormat(ai))
+                    muxer.start()
+                    val buf = ByteBuffer.allocate(8 * 1024 * 1024)
+                    val info = MediaCodec.BufferInfo()
+                    var vDone = false
+                    var aDone = false
+                    while (!(vDone && aDone)) {
+                        val useV = !vDone && (aDone || vEx.sampleTime <= aEx.sampleTime)
+                        val ex = if (useV) vEx else aEx
+                        val tr = if (useV) vt else at
+                        val size = ex.readSampleData(buf, 0)
+                        if (size < 0) {
+                            if (useV) vDone = true else aDone = true
+                            continue
+                        }
+                        info.set(0, size, ex.sampleTime, ex.sampleFlags)
+                        muxer.writeSampleData(tr, buf, info)
+                        ex.advance()
+                    }
+                    muxer.stop()
+                    muxer.release()
+                    vEx.release()
+                    aEx.release()
+                }
+
+                private fun save(path: String, name: String, mime: String): String {
+                    val src = File(path)
+                    val resultUri: String
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        val v = ContentValues()
+                        v.put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+                        v.put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                        v.put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/ABH YouTube")
+                        v.put(MediaStore.MediaColumns.IS_PENDING, 1)
+                        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)
+                            ?: throw Exception("insert failed")
+                        contentResolver.openOutputStream(uri)!!.use { o ->
+                            src.inputStream().use { it.copyTo(o, 1 shl 20) }
+                        }
+                        v.clear()
+                        v.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        contentResolver.update(uri, v, null, null)
+                        resultUri = uri.toString()
+                    } else {
+                        val dir = File(
+                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                            "ABH YouTube"
+                        )
+                        dir.mkdirs()
+                        val dst = File(dir, name)
+                        src.copyTo(dst, true)
+                        resultUri = Uri.fromFile(dst).toString()
+                    }
+                    src.delete()
+                    return resultUri
+                }
+            }
+            KOT
+          } > "$F"
+      - name: Manifest changes
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' $M
+          sed -i 's#android:label="[^"]*"#android:label="ABH YouTube"#' $M
       - run: flutter pub get
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
-          name: youtube-apk
+          name: abh-youtube-apk
           path: build/app/outputs/flutter-apk/app-release.apk
