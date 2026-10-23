@@ -66,7 +66,10 @@ jobs:
                 YoutubePlayerController.fromVideoId(
               videoId: 'dQw4w9WgXcQ',
               autoPlay: false,
-              params: const YoutubePlayerParams(showFullscreenButton: true),
+              params: const YoutubePlayerParams(
+                showFullscreenButton: true,
+                origin: 'https://www.youtube-nocookie.com',
+              ),
             );
 
             void _msg(String m) => ScaffoldMessenger.of(context)
