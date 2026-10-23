@@ -1,0 +1,116 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create Android project
+        run: flutter create --platforms=android --project-name youtube_app .
+      - name: Write app code
+        run: |
+          cat > pubspec.yaml <<'EOF'
+          name: youtube_app
+          description: Simple YouTube player
+          publish_to: none
+          version: 1.0.0+1
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            youtube_player_iframe: ^5.2.1
+          flutter:
+            uses-material-design: true
+          EOF
+          cat > lib/main.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:youtube_player_iframe/youtube_player_iframe.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'YouTube Player',
+                  theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
+                  home: const PlayerPage(),
+                );
+          }
+
+          class PlayerPage extends StatefulWidget {
+            const PlayerPage({super.key});
+            @override
+            State<PlayerPage> createState() => _PlayerPageState();
+          }
+
+          class _PlayerPageState extends State<PlayerPage> {
+            final _text = TextEditingController();
+            late final YoutubePlayerController _controller =
+                YoutubePlayerController.fromVideoId(
+              videoId: 'dQw4w9WgXcQ',
+              autoPlay: false,
+              params: const YoutubePlayerParams(showFullscreenButton: true),
+            );
+
+            void _play() {
+              final id = YoutubePlayerController.convertUrlToId(_text.text.trim());
+              if (id == null) {
+                ScaffoldMessenger.of(context)
+                    .showSnackBar(const SnackBar(content: Text('Link thappu')));
+                return;
+              }
+              _controller.loadVideoById(videoId: id);
+            }
+
+            @override
+            void dispose() {
+              _controller.close();
+              _text.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: const Text('YouTube Player')),
+                  body: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Column(children: [
+                      YoutubePlayer(controller: _controller, aspectRatio: 16 / 9),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: _text,
+                        decoration: const InputDecoration(
+                          labelText: 'YouTube link paste pannunga',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton.icon(
+                        onPressed: _play,
+                        icon: const Icon(Icons.play_arrow),
+                        label: const Text('Play'),
+                      ),
+                    ]),
+                  ),
+                );
+          }
+          EOF
+      - name: Add internet permission
+        run: sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: youtube-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
