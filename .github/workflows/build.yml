@@ -50,15 +50,25 @@ jobs:
           const appName = 'ABH YouTube';
           const _ch = MethodChannel('abh/media');
 
+          final darkMode = ValueNotifier<bool>(false);
+
           void main() => runApp(const MyApp());
 
           class MyApp extends StatelessWidget {
             const MyApp({super.key});
             @override
-            Widget build(BuildContext context) => MaterialApp(
-                  title: appName,
-                  theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
-                  home: const PlayerPage(),
+            Widget build(BuildContext context) => ValueListenableBuilder<bool>(
+                  valueListenable: darkMode,
+                  builder: (_, dark, __) => MaterialApp(
+                    title: appName,
+                    themeMode: dark ? ThemeMode.dark : ThemeMode.light,
+                    theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
+                    darkTheme: ThemeData(
+                        colorSchemeSeed: Colors.red,
+                        brightness: Brightness.dark,
+                        useMaterial3: true),
+                    home: const PlayerPage(),
+                  ),
                 );
           }
 
@@ -93,6 +103,11 @@ jobs:
             bool _barVisible = true;
             int _playSecs = 0;
             Timer? _timer;
+            int _tab = 0;
+            String _homeQ = homeQuery;
+            String _name = '';
+            final _homeCtl = TextEditingController();
+            final _nameCtl = TextEditingController();
 
             late final YoutubePlayerController _controller =
                 YoutubePlayerController.fromVideoId(
@@ -107,8 +122,7 @@ jobs:
             @override
             void initState() {
               super.initState();
-              _loadDone();
-              _runSearch(homeQuery, quiet: true, cueFirst: true);
+              _init();
               _timer = Timer.periodic(const Duration(seconds: 1), (_) {
                 if (!mounted) return;
                 final playing = _controller.value.playerState == PlayerState.playing;
@@ -120,6 +134,41 @@ jobs:
                   if (!_barVisible) setState(() => _barVisible = true);
                 }
               });
+            }
+
+            Future<void> _init() async {
+              await _loadSettings();
+              await _loadDone();
+              await _runSearch(_homeQ, quiet: true, cueFirst: true);
+            }
+
+            Future<File> _settingsFile() async {
+              final dir = await getApplicationDocumentsDirectory();
+              return File('${dir.path}/settings.json');
+            }
+
+            Future<void> _loadSettings() async {
+              try {
+                final f = await _settingsFile();
+                if (await f.exists()) {
+                  final m = jsonDecode(await f.readAsString()) as Map;
+                  darkMode.value = m['dark'] == true;
+                  final h = m['home'];
+                  if (h is String && h.trim().isNotEmpty) _homeQ = h.trim();
+                  final n = m['name'];
+                  if (n is String) _name = n;
+                }
+              } catch (_) {}
+              _homeCtl.text = _homeQ;
+              _nameCtl.text = _name;
+            }
+
+            Future<void> _saveSettings() async {
+              try {
+                final f = await _settingsFile();
+                await f.writeAsString(jsonEncode(
+                    {'dark': darkMode.value, 'home': _homeQ, 'name': _name}));
+              } catch (_) {}
             }
 
             Future<File> _doneFile() async {
@@ -386,7 +435,12 @@ jobs:
                   'name': '${_safe(title, id)} [${o.label.split(' ').first}].$ext',
                   'mime': mime,
                 });
-                _done[id] = {'uri': uri ?? '', 'mime': mime};
+                _done[id] = {
+                  'uri': uri ?? '',
+                  'mime': mime,
+                  'title': title,
+                  'q': o.label.split(' ').first,
+                };
                 await _saveDone();
                 _msg('Download mudinjadhu: Download > ABH YouTube folder');
               } catch (e) {
@@ -453,13 +507,12 @@ jobs:
               _controller.close();
               _yt.close();
               _text.dispose();
+              _homeCtl.dispose();
+              _nameCtl.dispose();
               super.dispose();
             }
 
-            @override
-            Widget build(BuildContext context) => Scaffold(
-                  appBar: AppBar(title: const Text(appName)),
-                  body: Column(children: [
+            Widget _home() => Column(children: [
                     AnimatedOpacity(
                       opacity: _barVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 400),
@@ -531,8 +584,211 @@ jobs:
                         },
                       ),
                     ),
-                  ]),
-                );
+            ]);
+
+            Future<bool> _confirm(String title, String body) async {
+              final r = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: Text(title),
+                  content: Text(body),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(ctx, false),
+                        child: const Text('Venam')),
+                    FilledButton(
+                        onPressed: () => Navigator.pop(ctx, true),
+                        child: const Text('Aamaa')),
+                  ],
+                ),
+              );
+              return r == true;
+            }
+
+            Future<void> _removeDone(String id) async {
+              final ok = await _confirm('List la irundhu neekkanuma?',
+                  'File Download > ABH YouTube folder la appadiye irukkum. List la irundhu mattum neekkum. Apram thirumba download pannalaam.');
+              if (!ok) return;
+              setState(() => _done.remove(id));
+              await _saveDone();
+            }
+
+            Future<void> _clearDone() async {
+              final ok = await _confirm('Download list clear pannanuma?',
+                  'Files delete aagaadhu. List mattum clear aagum.');
+              if (!ok) return;
+              setState(() => _done.clear());
+              await _saveDone();
+            }
+
+            Future<void> _applyHome() async {
+              FocusScope.of(context).unfocus();
+              final t = _homeCtl.text.trim();
+              _homeQ = t.isEmpty ? homeQuery : t;
+              _homeCtl.text = _homeQ;
+              await _saveSettings();
+              setState(() => _label = 'Trending');
+              _msg('Save aachu');
+              _runSearch(_homeQ, quiet: true);
+            }
+
+            Widget _files() {
+              final items = _done.entries.toList().reversed.toList();
+              if (items.isEmpty) {
+                return const Center(child: Text('Innum download onnum illa'));
+              }
+              return ListView.builder(
+                itemCount: items.length,
+                itemBuilder: (context, i) {
+                  final id = items[i].key;
+                  final d = items[i].value;
+                  final title = (d['title'] as String?) ?? id;
+                  final q = (d['q'] as String?) ?? '';
+                  return ListTile(
+                    leading: Image.network(
+                      'https://img.youtube.com/vi/$id/mqdefault.jpg',
+                      width: 80,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) =>
+                          const SizedBox(width: 80, child: Icon(Icons.movie)),
+                    ),
+                    title: Text(title, maxLines: 2, overflow: TextOverflow.ellipsis),
+                    subtitle: Text(q.isEmpty ? 'ABH YouTube' : '$q  •  ABH YouTube'),
+                    trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                      IconButton(
+                        tooltip: 'Paarkka',
+                        icon: const Icon(Icons.visibility),
+                        onPressed: () => _openDone(id),
+                      ),
+                      IconButton(
+                        tooltip: 'List la irundhu neekku',
+                        icon: const Icon(Icons.close),
+                        onPressed: () => _removeDone(id),
+                      ),
+                    ]),
+                  );
+                },
+              );
+            }
+
+            Widget _settings() => ListView(children: [
+                  ValueListenableBuilder<bool>(
+                    valueListenable: darkMode,
+                    builder: (_, dark, __) => SwitchListTile(
+                      secondary: const Icon(Icons.dark_mode),
+                      title: const Text('Dark mode'),
+                      value: dark,
+                      onChanged: (v) {
+                        darkMode.value = v;
+                        _saveSettings();
+                      },
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                    child: Row(children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _homeCtl,
+                          decoration: const InputDecoration(
+                            labelText: 'Home la ethu kaattanum (search)',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(onPressed: _applyHome, child: const Text('Save')),
+                    ]),
+                  ),
+                  const ListTile(
+                    leading: Icon(Icons.folder),
+                    title: Text('Download folder'),
+                    subtitle: Text('Download > ABH YouTube'),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.delete_sweep),
+                    title: const Text('Download list clear pannu'),
+                    subtitle: const Text('Files delete aagaadhu'),
+                    onTap: _clearDone,
+                  ),
+                  const ListTile(
+                    leading: Icon(Icons.info_outline),
+                    title: Text(appName),
+                    subtitle: Text('Version 1.0'),
+                  ),
+                ]);
+
+            Widget _profile() {
+              final n = _name.trim();
+              final initial = n.isEmpty ? 'A' : String.fromCharCode(n.runes.first);
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                const SizedBox(height: 16),
+                Center(
+                  child: CircleAvatar(
+                    radius: 48,
+                    child: Text(initial.toUpperCase(),
+                        style: const TextStyle(fontSize: 36)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Center(
+                  child: Text(n.isEmpty ? 'Peyar set pannala' : n,
+                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 20),
+                TextField(
+                  controller: _nameCtl,
+                  decoration: const InputDecoration(
+                    labelText: 'Unga peyar',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton(
+                  onPressed: () {
+                    FocusScope.of(context).unfocus();
+                    setState(() => _name = _nameCtl.text.trim());
+                    _saveSettings();
+                    _msg('Save aachu');
+                  },
+                  child: const Text('Save'),
+                ),
+                const SizedBox(height: 20),
+                Card(
+                  child: ListTile(
+                    leading: const Icon(Icons.download_done),
+                    title: const Text('Mothama download'),
+                    trailing: Text('${_done.length}',
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ),
+                ),
+              ]);
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              const titles = [appName, 'My Files', 'Settings', 'Profile'];
+              return Scaffold(
+                appBar: AppBar(title: Text(titles[_tab])),
+                body: IndexedStack(
+                  index: _tab,
+                  children: [_home(), _files(), _settings(), _profile()],
+                ),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: _tab,
+                  onDestinationSelected: (i) {
+                    if (i != 0) _controller.pauseVideo();
+                    setState(() => _tab = i);
+                  },
+                  destinations: const [
+                    NavigationDestination(icon: Icon(Icons.home), label: 'Home'),
+                    NavigationDestination(icon: Icon(Icons.folder), label: 'My Files'),
+                    NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+                    NavigationDestination(icon: Icon(Icons.person), label: 'Profile'),
+                  ],
+                ),
+              );
+            }
           }
           EOF
       - name: Write native code
