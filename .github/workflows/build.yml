@@ -82,13 +82,15 @@ jobs:
             final bool webm;
             final String? hlsVideo;
             final String? hlsAudio;
+            final String? hlsUa;
             _Opt(this.h, this.label, this.mb,
                 {this.muxed,
                 this.video,
                 this.audio,
                 this.webm = false,
                 this.hlsVideo,
-                this.hlsAudio});
+                this.hlsAudio,
+                this.hlsUa});
           }
 
           class _HlsVar {
@@ -97,7 +99,8 @@ jobs:
             final int bw;
             final String url;
             final String? audio;
-            _HlsVar(this.h, this.fps, this.bw, this.url, this.audio);
+            final String ua;
+            _HlsVar(this.h, this.fps, this.bw, this.url, this.audio, this.ua);
           }
 
           class _Media {
@@ -382,23 +385,81 @@ jobs:
             // ---------------- HLS (m3u8) ----------------
             static const _hlsUa =
                 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15';
+            static const _iosUa =
+                'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+            String _hlsDbg = '';
 
-            Future<String> _httpText(String url) async {
+            String _short(Object e) {
+              final t = e.toString().replaceAll('\n', ' ');
+              return t.length > 40 ? t.substring(0, 40) : t;
+            }
+
+            Future<String> _httpText(String url, String ua) async {
               final c = HttpClient()
                 ..connectionTimeout = const Duration(seconds: 12)
-                ..userAgent = _hlsUa;
+                ..userAgent = ua;
               try {
                 final req =
                     await c.getUrl(Uri.parse(url)).timeout(const Duration(seconds: 12));
                 final res = await req.close().timeout(const Duration(seconds: 12));
                 if (res.statusCode != 200) {
                   await res.drain();
-                  throw 'http ${res.statusCode}';
+                  throw 'm3u8 http ${res.statusCode}';
                 }
                 return await res
                     .transform(utf8.decoder)
                     .join()
                     .timeout(const Duration(seconds: 20));
+              } finally {
+                c.close(force: true);
+              }
+            }
+
+            // iOS client la irundhu nerave HLS master link edukkum
+            Future<String> _iosHlsMaster(String id) async {
+              final c = HttpClient()
+                ..connectionTimeout = const Duration(seconds: 10)
+                ..userAgent = _iosUa;
+              try {
+                final req = await c
+                    .postUrl(Uri.parse(
+                        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false&key=AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc'))
+                    .timeout(const Duration(seconds: 10));
+                req.headers.set('Content-Type', 'application/json');
+                req.headers.set('X-YouTube-Client-Name', '5');
+                req.headers.set('X-YouTube-Client-Version', '20.10.4');
+                req.headers.set('Origin', 'https://www.youtube.com');
+                req.add(utf8.encode(jsonEncode({
+                  'context': {
+                    'client': {
+                      'clientName': 'IOS',
+                      'clientVersion': '20.10.4',
+                      'deviceMake': 'Apple',
+                      'deviceModel': 'iPhone16,2',
+                      'osName': 'iPhone',
+                      'osVersion': '18.3.2.22D82',
+                      'hl': 'en',
+                      'gl': 'US',
+                    }
+                  },
+                  'videoId': id,
+                  'contentCheckOk': true,
+                  'racyCheckOk': true,
+                })));
+                final res = await req.close().timeout(const Duration(seconds: 15));
+                final body = await res
+                    .transform(utf8.decoder)
+                    .join()
+                    .timeout(const Duration(seconds: 15));
+                if (res.statusCode != 200) throw 'ios http ${res.statusCode}';
+                final j = jsonDecode(body) as Map;
+                final sd = j['streamingData'];
+                final u = sd is Map ? sd['hlsManifestUrl'] : null;
+                if (u is! String) {
+                  final ps = j['playabilityStatus'];
+                  throw 'ios no hls (${ps is Map ? ps['status'] : '?'})';
+                }
+                return u;
               } finally {
                 c.close(force: true);
               }
@@ -414,7 +475,7 @@ jobs:
               return m;
             }
 
-            List<_HlsVar> _parseMaster(String text, Uri base) {
+            List<_HlsVar> _parseMaster(String text, Uri base, String ua) {
               final lines = text.split('\n').map((e) => e.trim()).toList();
               final groups = <String, String>{};
               for (final l in lines) {
@@ -454,7 +515,8 @@ jobs:
                     double.tryParse(a['FRAME-RATE'] ?? '') ?? 30,
                     int.tryParse(a['BANDWIDTH'] ?? '') ?? 0,
                     base.resolve(lines[j]).toString(),
-                    audio));
+                    audio,
+                    ua));
               }
               return out;
             }
@@ -479,66 +541,77 @@ jobs:
               return _Media(init, segs);
             }
 
-            Future<_Media> _hlsMedia(String url) async =>
-                _parseMedia(await _httpText(url), Uri.parse(url));
+            Future<_Media> _hlsMedia(String url, String ua) async =>
+                _parseMedia(await _httpText(url, ua), Uri.parse(url));
 
-            Future<bool> _segOk(Uri u) async {
+            Future<int> _segStatus(Uri u, String ua) async {
               final c = HttpClient()
                 ..connectionTimeout = const Duration(seconds: 8)
-                ..userAgent = _hlsUa;
+                ..userAgent = ua;
               try {
                 final req = await c.getUrl(u).timeout(const Duration(seconds: 8));
                 final res = await req.close().timeout(const Duration(seconds: 8));
                 if (res.statusCode != 200) {
                   await res.drain();
-                  return false;
+                  return res.statusCode;
                 }
                 await for (final _ in res.timeout(const Duration(seconds: 8))) {
                   break;
                 }
-                return true;
+                return 200;
               } catch (_) {
-                return false;
+                return -1;
               } finally {
                 c.close(force: true);
               }
             }
 
-            Future<bool> _hlsProbe(_HlsVar v) async {
+            // null = OK, illana kaaranam
+            Future<String?> _hlsProbe(_HlsVar v) async {
               try {
-                final m = await _hlsMedia(v.url);
+                final m = await _hlsMedia(v.url, v.ua);
                 final n = m.segs.length;
                 for (final i in <int>{0, n ~/ 2, n - 1}) {
-                  if (!await _segOk(m.segs[i])) return false;
+                  final st = await _segStatus(m.segs[i], v.ua);
+                  if (st != 200) return '${v.h}p seg$i:$st';
                 }
                 if (v.audio != null) {
-                  final a = await _hlsMedia(v.audio!);
-                  if (!await _segOk(a.segs.first)) return false;
+                  final a = await _hlsMedia(v.audio!, v.ua);
+                  final st = await _segStatus(a.segs.first, v.ua);
+                  if (st != 200) return '${v.h}p audio:$st';
                 }
-                return true;
-              } catch (_) {
-                return false;
+                return null;
+              } catch (e) {
+                return '${v.h}p ${_short(e)}';
               }
             }
 
             Future<List<_Opt>> _hlsOpts(String id) async {
-              final entries = <List<dynamic>>[]; // [url, height, kind]
-              for (final c in <List<yte.YoutubeApiClient>?>[
-                [yte.YoutubeApiClient.safari],
-                null,
-              ]) {
-                try {
-                  final m = await _yt.videos.streamsClient.getManifest(id, ytClients: c);
-                  final dynamic h = (m as dynamic).hls;
-                  for (final e in (h as Iterable)) {
-                    final d = e as dynamic;
-                    var hh = 0;
-                    try {
-                      hh = d.videoResolution.height as int;
-                    } catch (_) {}
-                    entries.add([d.url.toString(), hh, e.runtimeType.toString()]);
-                  }
-                } catch (_) {}
+              final dbg = <String>[];
+              final entries = <List<dynamic>>[]; // [url, height, kind, ua]
+              try {
+                final m = await _yt.videos.streamsClient
+                    .getManifest(id, ytClients: [yte.YoutubeApiClient.safari]);
+                final dynamic h = (m as dynamic).hls;
+                var n = 0;
+                for (final e in (h as Iterable)) {
+                  final d = e as dynamic;
+                  var hh = 0;
+                  try {
+                    hh = d.videoResolution.height as int;
+                  } catch (_) {}
+                  entries.add([d.url.toString(), hh, e.runtimeType.toString(), _hlsUa]);
+                  n++;
+                }
+                dbg.add('safari:$n');
+              } catch (e) {
+                dbg.add('safari ${_short(e)}');
+              }
+              try {
+                entries.add([await _iosHlsMaster(id), 0, 'master', _iosUa]);
+                dbg.add('ios:ok');
+              } catch (e) {
+                dbg.add(_short(e));
               }
               final best = <int, _HlsVar>{};
               void add(_HlsVar v) {
@@ -546,40 +619,50 @@ jobs:
                 if (cur == null || v.bw > cur.bw) best[v.h] = v;
               }
 
+              var parseErr = '';
               for (final en in entries) {
                 try {
                   final url = en[0] as String;
-                  final text = await _httpText(url);
+                  final ua = en[3] as String;
+                  final text = await _httpText(url, ua);
                   if (text.contains('#EXT-X-STREAM-INF')) {
-                    _parseMaster(text, Uri.parse(url)).forEach(add);
+                    _parseMaster(text, Uri.parse(url), ua).forEach(add);
                   } else if (text.contains('#EXTINF') &&
                       (en[1] as int) > 0 &&
                       !(en[2] as String).contains('Audio')) {
-                    add(_HlsVar(en[1] as int, 30, 0, url, null));
+                    add(_HlsVar(en[1] as int, 30, 0, url, null, ua));
                   }
-                } catch (_) {}
+                } catch (e) {
+                  parseErr = _short(e);
+                }
               }
               final vars = best.values.where((v) => v.h > 0).toList();
-              final ok = await Future.wait(vars.map(_hlsProbe));
+              dbg.add('variants:${vars.length}');
+              if (parseErr.isNotEmpty) dbg.add(parseErr);
+              final probes = await Future.wait(vars.map(_hlsProbe));
+              final bad = probes.whereType<String>().toList();
+              dbg.add('probe ${vars.length - bad.length}/${vars.length}');
+              if (bad.isNotEmpty) dbg.add(bad.first);
+              _hlsDbg = dbg.join(' • ');
               final res = <_Opt>[];
               for (var i = 0; i < vars.length; i++) {
-                if (!ok[i]) continue;
+                if (probes[i] != null) continue;
                 final v = vars[i];
                 res.add(_Opt(v.h, _lbl(v.h, v.fps), -1,
-                    hlsVideo: v.url, hlsAudio: v.audio));
+                    hlsVideo: v.url, hlsAudio: v.audio, hlsUa: v.ua));
               }
               return res;
             }
 
             // Segments ellam 6 connection la irundhu irakki, order padi file la serkkum
             Future<void> _hlsDownload(String url, File out, String id,
-                void Function(int, int) onSeg, void Function(int) onBytes) async {
-              final media = await _hlsMedia(url);
+                void Function(int, int) onSeg, void Function(int) onBytes, String ua) async {
+              final media = await _hlsMedia(url, ua);
               final init = media.init;
               final all = <Uri>[if (init != null) init, ...media.segs];
               final client = HttpClient()
                 ..connectionTimeout = const Duration(seconds: 15)
-                ..userAgent = _hlsUa;
+                ..userAgent = ua;
               _clients[id] = client;
               final sink = out.openWrite();
               final buf = <int, List<List<int>>>{};
@@ -722,6 +805,12 @@ jobs:
                         child: Text(
                             'Indha video-ku mela irukkura quality YouTube ippo allow pannala (403)',
                             style: TextStyle(fontSize: 12)),
+                      ),
+                    if (opts.every((o) => o.h <= 360))
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text('HLS: $_hlsDbg',
+                            style: const TextStyle(fontSize: 11, color: Colors.grey)),
                       ),
                     Flexible(
                       child: ListView(shrinkWrap: true, children: [
@@ -1013,10 +1102,10 @@ jobs:
                   out = File('${tmp.path}/${id}_out.mp4');
                   temps.addAll([vf, af, out]);
                   await _hlsDownload(o.hlsVideo!, vf, id,
-                      (d, t) => hTick(d / t * (hasA ? 0.85 : 1.0)), (b) => hb += b);
+                      (d, t) => hTick(d / t * (hasA ? 0.85 : 1.0)), (b) => hb += b, o.hlsUa ?? _hlsUa);
                   if (hasA) {
                     await _hlsDownload(o.hlsAudio!, af, id,
-                        (d, t) => hTick(0.85 + 0.15 * d / t), (b) => hb += b);
+                        (d, t) => hTick(0.85 + 0.15 * d / t), (b) => hb += b, o.hlsUa ?? _hlsUa);
                   }
                   if (_cancelled.contains(id)) throw 'cancelled';
                   if (mounted) {
