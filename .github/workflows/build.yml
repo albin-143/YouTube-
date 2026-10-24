@@ -332,6 +332,55 @@ jobs:
               return opts;
             }
 
+            Future<bool> _probe(yte.StreamInfo s) async {
+              final c = HttpClient()
+                ..connectionTimeout = const Duration(seconds: 8)
+                ..userAgent = _uaFor(s.url);
+              try {
+                final req = await c
+                    .getUrl(Uri.parse('${s.url}&range=0-1'))
+                    .timeout(const Duration(seconds: 8));
+                final res = await req.close().timeout(const Duration(seconds: 8));
+                await res.drain();
+                return res.statusCode == 200 || res.statusCode == 206;
+              } catch (_) {
+                return false;
+              } finally {
+                c.close(force: true);
+              }
+            }
+
+            // Rendu moonu client la irundhu manifest eduthu, work aagura quality mattum kaattum
+            Future<List<_Opt>> _loadOpts(String id) async {
+              final sets = <List<yte.YoutubeApiClient>?>[
+                null,
+                [yte.YoutubeApiClient.androidVr],
+                [yte.YoutubeApiClient.safari],
+              ];
+              final mans = await Future.wait(sets.map((c) async {
+                try {
+                  return await _yt.videos.streamsClient.getManifest(id, ytClients: c);
+                } catch (_) {
+                  return null;
+                }
+              }));
+              final all = <_Opt>[];
+              for (final m in mans) {
+                if (m != null) all.addAll(_buildOpts(m));
+              }
+              if (all.isEmpty) throw 'no manifest';
+              final ok = await Future.wait(all.map((o) async {
+                if (o.muxed != null) return true;
+                return await _probe(o.video!) && await _probe(o.audio!);
+              }));
+              final byLabel = <String, _Opt>{};
+              for (var i = 0; i < all.length; i++) {
+                if (ok[i]) byLabel.putIfAbsent(all[i].label, () => all[i]);
+              }
+              final res = byLabel.values.toList()..sort((a, b) => b.h.compareTo(a.h));
+              return res;
+            }
+
             Future<void> _onDownloadTap(String id, String title) async {
               if (id.isEmpty) return;
               if (_done.containsKey(id)) {
@@ -342,8 +391,7 @@ jobs:
               setState(() => _progress[id] = 0);
               List<_Opt> opts;
               try {
-                final manifest = await _yt.videos.streamsClient.getManifest(id);
-                opts = _buildOpts(manifest);
+                opts = await _loadOpts(id);
               } catch (e) {
                 _msg('Quality edukka mudiyala. Thirumba try pannunga');
                 if (mounted) setState(() => _progress.remove(id));
@@ -364,6 +412,13 @@ jobs:
                       child: Text('Quality select pannunga',
                           style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
                     ),
+                    if (opts.every((o) => o.h <= 360))
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+                        child: Text(
+                            'Indha video-ku mela irukkura quality YouTube ippo allow pannala (403)',
+                            style: TextStyle(fontSize: 12)),
+                      ),
                     Flexible(
                       child: ListView(shrinkWrap: true, children: [
                         for (final o in opts)
@@ -469,13 +524,16 @@ jobs:
                       var counted = 0;
                       try {
                         final req = await client
-                            .getUrl(s.url)
+                            .getUrl(Uri.parse('${s.url}&range=$start-$end'))
                             .timeout(const Duration(seconds: 15));
-                        req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
                         final res = await req.close().timeout(const Duration(seconds: 15));
-                        if (res.statusCode != 206) {
+                        if (res.statusCode != 206 && res.statusCode != 200) {
                           await res.drain();
                           throw 'http ${res.statusCode}';
+                        }
+                        if (res.contentLength != end - start + 1) {
+                          await res.drain();
+                          throw 'range ignored';
                         }
                         final bb = BytesBuilder(copy: false);
                         await for (final d in res.timeout(const Duration(seconds: 12))) {
@@ -534,7 +592,9 @@ jobs:
               }
               final sink = f.openWrite();
               try {
-                await for (final chunk in _yt.videos.streamsClient.get(s)) {
+                await for (final chunk in _yt.videos.streamsClient
+                    .get(s)
+                    .timeout(const Duration(seconds: 25))) {
                   if (_cancelled.contains(id)) throw 'cancelled';
                   sink.add(chunk);
                   onBytes(chunk.length);
@@ -632,7 +692,9 @@ jobs:
                     await _ch.invokeMethod('cancelNotif', {'id': _nid(id)});
                   } catch (_) {}
                 } else {
-                  _msg('Download fail aachu');
+                  var why = e.toString();
+                  if (why.length > 70) why = why.substring(0, 70);
+                  _msg('Download fail: $why');
                   _notify(id, title, 'Download fail aachu', 100, false);
                 }
               }
