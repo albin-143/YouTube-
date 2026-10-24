@@ -487,19 +487,18 @@ jobs:
               }
             }
 
-            // Veegama download: 8 connection sernthu (parallel), timeout + retry irukku
+            // Veegama download: 8 connection sernthu (parallel). Oru chunk fail aanaa
+            // adha mattum thirumba try pannum, restart aagaadhu. 403 vandhaa connection kuraikkum.
             Future<void> _fetchFast(
                 yte.StreamInfo s, File f, String id, void Function(int) onBytes) async {
               final total = s.size.totalBytes;
-              const chunk = 2 * 1024 * 1024;
+              const chunk = 1024 * 1024;
               final n = (total + chunk - 1) ~/ chunk;
               final client = HttpClient()
                 ..connectionTimeout = const Duration(seconds: 15)
                 ..userAgent = _uaFor(s.url);
               _clients[id] = client;
               final raf = await f.open(mode: FileMode.write);
-              var next = 0;
-              var failed = false;
               Future<void> lock = Future.value();
               Future<void> writeAt(int pos, List<int> data) {
                 final p = lock.then((_) async {
@@ -510,58 +509,86 @@ jobs:
                 return p;
               }
 
+              final todo = List<int>.generate(n, (i) => i);
+              final failed = <int>[];
+              var workers = 8;
+              var doneCount = 0;
+              var hardFails = 0;
+              var lastErr = '';
+
               Future<void> worker() async {
-                try {
-                  while (!failed) {
-                    if (_cancelled.contains(id)) throw 'cancelled';
-                    final i = next++;
-                    if (i >= n) return;
-                    final start = i * chunk;
-                    final end =
-                        (start + chunk - 1 < total) ? start + chunk - 1 : total - 1;
-                    var attempt = 0;
-                    while (true) {
-                      var counted = 0;
-                      try {
-                        final req = await client
-                            .getUrl(Uri.parse('${s.url}&range=$start-$end'))
-                            .timeout(const Duration(seconds: 15));
-                        final res = await req.close().timeout(const Duration(seconds: 15));
-                        if (res.statusCode != 206 && res.statusCode != 200) {
-                          await res.drain();
-                          throw 'http ${res.statusCode}';
-                        }
-                        if (res.contentLength != end - start + 1) {
-                          await res.drain();
-                          throw 'range ignored';
-                        }
-                        final bb = BytesBuilder(copy: false);
-                        await for (final d in res.timeout(const Duration(seconds: 12))) {
-                          bb.add(d);
-                          counted += d.length;
-                          onBytes(d.length);
-                        }
-                        final data = bb.takeBytes();
-                        if (data.length != end - start + 1) throw 'short';
-                        await writeAt(start, data);
-                        break;
-                      } catch (e) {
-                        onBytes(-counted);
-                        final hard = e is String && e.startsWith('http 4');
-                        if (_cancelled.contains(id) || failed || hard || ++attempt >= 3) {
-                          rethrow;
-                        }
+                while (true) {
+                  if (_cancelled.contains(id)) throw 'cancelled';
+                  if (todo.isEmpty) return;
+                  final i = todo.removeAt(0);
+                  final start = i * chunk;
+                  final end =
+                      (start + chunk - 1 < total) ? start + chunk - 1 : total - 1;
+                  var ok = false;
+                  var hard = false;
+                  for (var attempt = 0; attempt < 3 && !ok && !hard; attempt++) {
+                    var counted = 0;
+                    try {
+                      final req = await client
+                          .getUrl(Uri.parse('${s.url}&range=$start-$end'))
+                          .timeout(const Duration(seconds: 15));
+                      final res =
+                          await req.close().timeout(const Duration(seconds: 15));
+                      if (res.statusCode != 206 && res.statusCode != 200) {
+                        await res.drain();
+                        throw 'http ${res.statusCode}';
                       }
+                      if (res.contentLength != end - start + 1) {
+                        await res.drain();
+                        throw 'range ignored';
+                      }
+                      var pos = start;
+                      await for (final d in res.timeout(const Duration(seconds: 12))) {
+                        await writeAt(pos, d);
+                        pos += d.length;
+                        counted += d.length;
+                        onBytes(d.length);
+                      }
+                      if (counted != end - start + 1) throw 'short';
+                      ok = true;
+                    } catch (e) {
+                      onBytes(-counted);
+                      if (_cancelled.contains(id)) throw 'cancelled';
+                      lastErr = e.toString();
+                      if (e is String && e.startsWith('http 4')) hard = true;
                     }
                   }
-                } catch (e) {
-                  failed = true;
-                  rethrow;
+                  if (ok) {
+                    doneCount++;
+                  } else {
+                    failed.add(i);
+                    if (hard) hardFails++;
+                    return; // indha worker nikkum, apram kuraincha connection la thodarum
+                  }
                 }
               }
 
               try {
-                await Future.wait(List.generate(8, (_) => worker()));
+                var stuck = 0;
+                while (true) {
+                  _active[id]?['mode'] = 'Fast x$workers';
+                  final before = doneCount;
+                  await Future.wait(List.generate(workers, (_) => worker()));
+                  if (todo.isEmpty && failed.isEmpty) break;
+                  todo.addAll(failed);
+                  failed.clear();
+                  todo.sort();
+                  if (doneCount == before) {
+                    if (++stuck >= 3) throw lastErr;
+                  } else {
+                    stuck = 0;
+                  }
+                  if (hardFails > 0) {
+                    workers = workers > 1 ? workers ~/ 2 : 1;
+                    hardFails = 0;
+                  }
+                  await Future.delayed(const Duration(seconds: 2));
+                }
               } finally {
                 await lock;
                 await raf.close();
