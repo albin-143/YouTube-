@@ -110,6 +110,7 @@ jobs:
             final _nameCtl = TextEditingController();
             final Map<String, Map<String, dynamic>> _active = {};
             final Set<String> _cancelled = {};
+            final Map<String, HttpClient> _clients = {};
             int _activeCount = 0;
             int _filesTab = 0;
 
@@ -129,6 +130,13 @@ jobs:
               _init();
               _timer = Timer.periodic(const Duration(seconds: 1), (_) {
                 if (!mounted) return;
+                for (final d in _active.values) {
+                  final g = (d['got'] as int?) ?? 0;
+                  final pg = (d['prev'] as int?) ?? 0;
+                  d['speed'] = (g - pg) / 1048576.0;
+                  d['prev'] = g;
+                }
+                if (_active.isNotEmpty && _tab == 1) setState(() {});
                 final playing = _controller.value.playerState == PlayerState.playing;
                 if (playing) {
                   _playSecs++;
@@ -382,6 +390,14 @@ jobs:
               return s;
             }
 
+            // Cancel: ippove connection ah vettiduvom, list la irundhum udane neekkum
+            void _cancelDownload(String id) {
+              _cancelled.add(id);
+              _clients[id]?.close(force: true);
+              setState(() => _active.remove(id));
+              _msg('Download cancel aachu');
+            }
+
             int _nid(String id) => (id.hashCode & 0x0fffffff) + 1000;
 
             Future<void> _notify(
@@ -403,14 +419,29 @@ jobs:
               } catch (_) {}
             }
 
-            // Veegama download: 6 connection sernthu (parallel). Fail aanaa pazhaya mura
+            String _uaFor(Uri u) {
+              switch (u.queryParameters['c']) {
+                case 'ANDROID_VR':
+                  return 'com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+                case 'IOS':
+                  return 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+                case 'ANDROID':
+                  return 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip';
+                default:
+                  return 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+              }
+            }
+
+            // Veegama download: 8 connection sernthu (parallel), timeout + retry irukku
             Future<void> _fetchFast(
                 yte.StreamInfo s, File f, String id, void Function(int) onBytes) async {
               final total = s.size.totalBytes;
               const chunk = 2 * 1024 * 1024;
               final n = (total + chunk - 1) ~/ chunk;
               final client = HttpClient()
-                ..connectionTimeout = const Duration(seconds: 15);
+                ..connectionTimeout = const Duration(seconds: 15)
+                ..userAgent = _uaFor(s.url);
+              _clients[id] = client;
               final raf = await f.open(mode: FileMode.write);
               var next = 0;
               var failed = false;
@@ -433,21 +464,37 @@ jobs:
                     final start = i * chunk;
                     final end =
                         (start + chunk - 1 < total) ? start + chunk - 1 : total - 1;
-                    final req = await client.getUrl(s.url);
-                    req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
-                    final res = await req.close();
-                    if (res.statusCode != 206) {
-                      await res.drain();
-                      throw 'http ${res.statusCode}';
+                    var attempt = 0;
+                    while (true) {
+                      var counted = 0;
+                      try {
+                        final req = await client
+                            .getUrl(s.url)
+                            .timeout(const Duration(seconds: 15));
+                        req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$end');
+                        final res = await req.close().timeout(const Duration(seconds: 15));
+                        if (res.statusCode != 206) {
+                          await res.drain();
+                          throw 'http ${res.statusCode}';
+                        }
+                        final bb = BytesBuilder(copy: false);
+                        await for (final d in res.timeout(const Duration(seconds: 12))) {
+                          bb.add(d);
+                          counted += d.length;
+                          onBytes(d.length);
+                        }
+                        final data = bb.takeBytes();
+                        if (data.length != end - start + 1) throw 'short';
+                        await writeAt(start, data);
+                        break;
+                      } catch (e) {
+                        onBytes(-counted);
+                        final hard = e is String && e.startsWith('http 4');
+                        if (_cancelled.contains(id) || failed || hard || ++attempt >= 3) {
+                          rethrow;
+                        }
+                      }
                     }
-                    final bb = BytesBuilder(copy: false);
-                    await for (final d in res) {
-                      bb.add(d);
-                      onBytes(d.length);
-                    }
-                    final data = bb.takeBytes();
-                    if (data.length != end - start + 1) throw 'short';
-                    await writeAt(start, data);
                   }
                 } catch (e) {
                   failed = true;
@@ -456,10 +503,11 @@ jobs:
               }
 
               try {
-                await Future.wait(List.generate(6, (_) => worker()));
+                await Future.wait(List.generate(8, (_) => worker()));
               } finally {
                 await lock;
                 await raf.close();
+                if (_clients[id] == client) _clients.remove(id);
                 client.close(force: true);
               }
             }
@@ -473,12 +521,16 @@ jobs:
               }
 
               try {
+                _active[id]?['mode'] = 'Fast mode';
                 await _fetchFast(s, f, id, cnt);
                 return;
               } catch (e) {
                 if (_cancelled.contains(id)) rethrow;
                 onBytes(-counted);
                 counted = 0;
+                final m = e.toString();
+                _active[id]?['mode'] = 'Slow mode';
+                _active[id]?['err'] = m.length > 60 ? m.substring(0, 60) : m;
               }
               final sink = f.openWrite();
               try {
@@ -515,6 +567,7 @@ jobs:
                 var lastN = DateTime.fromMillisecondsSinceEpoch(0);
                 void tick(int n, int total) {
                   got += n;
+                  _active[id]?['got'] = got;
                   final raw = got * 100 ~/ total;
                   final pct = raw < 0 ? 0 : (raw > 100 ? 100 : raw);
                   if (pct != lastPct && mounted) {
@@ -548,6 +601,7 @@ jobs:
                       _active[id]?['merging'] = true;
                     });
                   }
+                  if (_cancelled.contains(id)) throw 'cancelled';
                   _notify(id, title, 'Merge aaguthu...', -1, true);
                   await _ch.invokeMethod('mux', {
                     'video': vf.path,
@@ -556,6 +610,7 @@ jobs:
                     'webm': o.webm,
                   });
                 }
+                if (_cancelled.contains(id)) throw 'cancelled';
                 final uri = await _ch.invokeMethod<String>('save', {
                   'path': out.path,
                   'name': '${_safe(title, id)} [$q].$ext',
@@ -827,15 +882,16 @@ jobs:
                           const SizedBox(height: 4),
                           Text(merging
                               ? 'Merge aaguthu...'
-                              : '${d['q']}  •  ${(p * 100).round()}%'),
+                              : '${d['q']}  •  ${(p * 100).round()}%  •  ${((d['speed'] as double?) ?? 0).toStringAsFixed(1)} MB/s'),
+                          if (d['mode'] != null)
+                            Text(
+                                '${d['mode']}${d['err'] != null ? '  •  ${d['err']}' : ''}',
+                                style: const TextStyle(fontSize: 11)),
                         ]),
                     trailing: IconButton(
                       tooltip: 'Cancel',
                       icon: const Icon(Icons.close),
-                      onPressed: () {
-                        _cancelled.add(id);
-                        _msg('Cancel panren...');
-                      },
+                      onPressed: () => _cancelDownload(id),
                     ),
                   );
                 },
