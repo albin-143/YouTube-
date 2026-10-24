@@ -332,17 +332,24 @@ jobs:
               return opts;
             }
 
+            // Quality nijamave download aagumaa nu paarkka: modhal, nadu, kadaisi pagudhi moonaiyum sodhikkum
+            // (YouTube sila quality ku modhal sila MB mattum tharum, apram 403 kodukkum)
             Future<bool> _probe(yte.StreamInfo s) async {
+              final total = s.size.totalBytes;
+              final spots = <int>{0, total ~/ 2, total > 4096 ? total - 2048 : 0};
               final c = HttpClient()
                 ..connectionTimeout = const Duration(seconds: 8)
                 ..userAgent = _uaFor(s.url);
               try {
-                final req = await c
-                    .getUrl(Uri.parse('${s.url}&range=0-1'))
-                    .timeout(const Duration(seconds: 8));
-                final res = await req.close().timeout(const Duration(seconds: 8));
-                await res.drain();
-                return res.statusCode == 200 || res.statusCode == 206;
+                for (final a in spots) {
+                  final req = await c
+                      .getUrl(Uri.parse('${s.url}&range=$a-${a + 1023}'))
+                      .timeout(const Duration(seconds: 8));
+                  final res = await req.close().timeout(const Duration(seconds: 8));
+                  await res.drain();
+                  if (res.statusCode != 200 && res.statusCode != 206) return false;
+                }
+                return true;
               } catch (_) {
                 return false;
               } finally {
