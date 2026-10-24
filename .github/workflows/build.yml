@@ -1,21 +1,31 @@
-name: Build ABH YouTube APK
+name: Build ABH YouTube
 on:
   push:
   workflow_dispatch:
 jobs:
-  apk:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
+        if: runner.os == 'Linux'
         with:
           distribution: temurin
           java-version: 17
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
-      - name: Create Android project
-        run: flutter create --platforms=android --project-name youtube_app .
+      - name: Create platform project
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then P=windows; else P=android; fi
+          flutter create --platforms=$P --project-name youtube_app .
       - name: Write app code
         run: |
           cat > pubspec.yaml <<'EOF'
@@ -49,6 +59,7 @@ jobs:
           const fallbackId = 'dQw4w9WgXcQ';
           const appName = 'ABH YouTube';
           const _ch = MethodChannel('abh/media');
+          final bool _win = Platform.isWindows;
 
           final darkMode = ValueNotifier<bool>(false);
 
@@ -139,19 +150,23 @@ jobs:
             int _activeCount = 0;
             int _filesTab = 0;
 
-            late final YoutubePlayerController _controller =
-                YoutubePlayerController.fromVideoId(
-              videoId: fallbackId,
-              autoPlay: false,
-              params: const YoutubePlayerParams(
-                showFullscreenButton: true,
-                origin: 'https://www.youtube-nocookie.com',
-              ),
-            );
+            YoutubePlayerController? _controller;
 
             @override
             void initState() {
               super.initState();
+              try {
+                _controller = YoutubePlayerController.fromVideoId(
+                  videoId: fallbackId,
+                  autoPlay: false,
+                  params: const YoutubePlayerParams(
+                    showFullscreenButton: true,
+                    origin: 'https://www.youtube-nocookie.com',
+                  ),
+                );
+              } catch (_) {
+                _controller = null; // indha platform la player illa
+              }
               _init();
               _timer = Timer.periodic(const Duration(seconds: 1), (_) {
                 if (!mounted) return;
@@ -162,7 +177,7 @@ jobs:
                   d['prev'] = g;
                 }
                 if (_active.isNotEmpty && _tab == 1) setState(() {});
-                final playing = _controller.value.playerState == PlayerState.playing;
+                final playing = _controller?.value.playerState == PlayerState.playing;
                 if (playing) {
                   _playSecs++;
                   if (_playSecs >= 5 && _barVisible) setState(() => _barVisible = false);
@@ -171,6 +186,88 @@ jobs:
                   if (!_barVisible) setState(() => _barVisible = true);
                 }
               });
+            }
+
+            // ---------- Platform helpers (Android = Kotlin, Windows = Dart) ----------
+            Future<T?> _call<T>(String m, [Map<String, dynamic>? a]) async {
+              if (_win) return (await _winCall(m, a ?? {})) as T?;
+              return _ch.invokeMethod<T>(m, a);
+            }
+
+            Future<dynamic> _winCall(String m, Map<String, dynamic> a) async {
+              switch (m) {
+                case 'mux':
+                  final exe =
+                      '${File(Platform.resolvedExecutable).parent.path}\\ffmpeg.exe';
+                  if (!await File(exe).exists()) throw 'ffmpeg.exe illa';
+                  final r = await Process.run(exe, [
+                    '-y',
+                    '-i',
+                    a['video'] as String,
+                    '-i',
+                    a['audio'] as String,
+                    '-map',
+                    '0:v:0',
+                    '-map',
+                    '1:a:0',
+                    '-c',
+                    'copy',
+                    a['out'] as String,
+                  ]);
+                  if (r.exitCode != 0) throw 'ffmpeg error ${r.exitCode}';
+                  return true;
+                case 'save':
+                  final home = Platform.environment['USERPROFILE'] ?? '.';
+                  final dir = Directory('$home\\Downloads\\ABH YouTube');
+                  await dir.create(recursive: true);
+                  final dst = File('${dir.path}\\${a['name']}');
+                  await File(a['path'] as String).copy(dst.path);
+                  try {
+                    await File(a['path'] as String).delete();
+                  } catch (_) {}
+                  return dst.path;
+                case 'open':
+                  await Process.run('explorer', [a['uri'] as String]);
+                  return true;
+                default:
+                  return null; // notification, service: Windows la thevai illa
+              }
+            }
+
+            Future<void> _openInBrowser() async {
+              if (_curId.isEmpty) return;
+              final url = 'https://www.youtube.com/watch?v=$_curId';
+              if (_win) {
+                await Process.run('explorer', [url]);
+              } else {
+                _msg(url);
+              }
+            }
+
+            Widget _playerWidget() {
+              final c = _controller;
+              if (c != null) return YoutubePlayer(controller: c, aspectRatio: 16 / 9);
+              return AspectRatio(
+                aspectRatio: 16 / 9,
+                child: Container(
+                  color: Colors.black,
+                  child: Stack(fit: StackFit.expand, children: [
+                    if (_curId.isNotEmpty)
+                      Image.network(
+                        'https://img.youtube.com/vi/$_curId/hqdefault.jpg',
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => const SizedBox(),
+                      ),
+                    Center(
+                      child: FilledButton.icon(
+                        onPressed: _openInBrowser,
+                        icon: const Icon(Icons.open_in_browser),
+                        label: const Text('Browser la paar'),
+                      ),
+                    ),
+                  ]),
+                ),
+              );
             }
 
             Future<void> _init() async {
@@ -250,7 +347,7 @@ jobs:
                 if (_results.isEmpty && !quiet) _msg('Onnum kedaikkala');
                 if (cueFirst && _results.isNotEmpty) {
                   final first = _results.first;
-                  _controller.cueVideoById(videoId: first.id.value);
+                  _controller?.cueVideoById(videoId: first.id.value);
                   setState(() {
                     _curId = first.id.value;
                     _curTitle = first.title;
@@ -269,7 +366,7 @@ jobs:
             }
 
             void _play(String id, String title) {
-              _controller.loadVideoById(videoId: id);
+              _controller?.loadVideoById(videoId: id);
               setState(() {
                 _curId = id;
                 _curTitle = title;
@@ -853,7 +950,7 @@ jobs:
             Future<void> _notify(
                 String id, String title, String text, int progress, bool ongoing) async {
               try {
-                await _ch.invokeMethod('notify', {
+                await _call('notify', {
                   'id': _nid(id),
                   'title': title,
                   'text': text,
@@ -865,7 +962,7 @@ jobs:
 
             Future<void> _svc(bool on) async {
               try {
-                await _ch.invokeMethod('svc', {'on': on});
+                await _call('svc', {'on': on});
               } catch (_) {}
             }
 
@@ -1036,7 +1133,7 @@ jobs:
               });
               if (_activeCount++ == 0) _svc(true);
               try {
-                await _ch.invokeMethod('askNotif');
+                await _call('askNotif');
               } catch (_) {}
               final tmp = await getTemporaryDirectory();
               final temps = <File>[];
@@ -1115,7 +1212,7 @@ jobs:
                     });
                   }
                   _notify(id, title, 'Merge aaguthu...', -1, true);
-                  await _ch.invokeMethod('mux', {
+                  await _call('mux', {
                     'video': vf.path,
                     'audio': (hasA ? af : vf).path,
                     'out': out.path,
@@ -1142,7 +1239,7 @@ jobs:
                   }
                   if (_cancelled.contains(id)) throw 'cancelled';
                   _notify(id, title, 'Merge aaguthu...', -1, true);
-                  await _ch.invokeMethod('mux', {
+                  await _call('mux', {
                     'video': vf.path,
                     'audio': af.path,
                     'out': out.path,
@@ -1150,7 +1247,7 @@ jobs:
                   });
                 }
                 if (_cancelled.contains(id)) throw 'cancelled';
-                final uri = await _ch.invokeMethod<String>('save', {
+                final uri = await _call<String>('save', {
                   'path': out.path,
                   'name': '${_safe(title, id)} [$q].$ext',
                   'mime': mime,
@@ -1168,7 +1265,7 @@ jobs:
                 if (_cancelled.contains(id)) {
                   _msg('Download cancel aachu');
                   try {
-                    await _ch.invokeMethod('cancelNotif', {'id': _nid(id)});
+                    await _call('cancelNotif', {'id': _nid(id)});
                   } catch (_) {}
                 } else {
                   var why = e.toString();
@@ -1199,7 +1296,7 @@ jobs:
                 return;
               }
               try {
-                await _ch.invokeMethod('open', {'uri': d['uri'], 'mime': d['mime']});
+                await _call('open', {'uri': d['uri'], 'mime': d['mime']});
               } catch (e) {
                 _msg('Video open panna mudiyala (file delete aagirukkalaam)');
               }
@@ -1242,7 +1339,7 @@ jobs:
             @override
             void dispose() {
               _timer?.cancel();
-              _controller.close();
+              _controller?.close();
               _yt.close();
               _text.dispose();
               _homeCtl.dispose();
@@ -1263,12 +1360,18 @@ jobs:
                               child: Text(_curTitle,
                                   maxLines: 1, overflow: TextOverflow.ellipsis),
                             ),
+                            if (_win)
+                              IconButton(
+                                tooltip: 'Browser la open',
+                                icon: const Icon(Icons.open_in_browser),
+                                onPressed: _openInBrowser,
+                              ),
                             _dlButton(_curId, _curTitle),
                           ]),
                         ),
                       ),
                     ),
-                    YoutubePlayer(controller: _controller, aspectRatio: 16 / 9),
+                    _playerWidget(),
                     Padding(
                       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                       child: Row(children: [
@@ -1584,7 +1687,7 @@ jobs:
                 bottomNavigationBar: NavigationBar(
                   selectedIndex: _tab,
                   onDestinationSelected: (i) {
-                    if (i != 0) _controller.pauseVideo();
+                    if (i != 0) _controller?.pauseVideo();
                     setState(() => _tab = i);
                   },
                   destinations: const [
@@ -1599,6 +1702,7 @@ jobs:
           }
           EOF
       - name: Write native code
+        if: runner.os == 'Linux'
         run: |
           F=$(find android/app/src/main -name MainActivity.kt | head -n 1)
           D=$(dirname "$F")
@@ -1856,14 +1960,39 @@ jobs:
           }
           SVC
       - name: Manifest changes
+        if: runner.os == 'Linux'
         run: |
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>\n    <application#' $M
           sed -i 's#</application>#    <service android:name=".DlService" android:foregroundServiceType="dataSync" android:exported="false"/>\n    </application>#' $M
           sed -i 's#android:label="[^"]*"#android:label="ABH YouTube"#' $M
+      - name: Windows tweaks
+        if: runner.os == 'Windows'
+        run: |
+          sed -i 's/L"youtube_app"/L"ABH YouTube"/' windows/runner/main.cpp
+          sed -i 's/set(BINARY_NAME "youtube_app")/set(BINARY_NAME "ABH_YouTube")/' windows/CMakeLists.txt
       - run: flutter pub get
-      - run: flutter build apk --release
+      - name: Build APK
+        if: runner.os == 'Linux'
+        run: flutter build apk --release
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        run: flutter build windows --release
+      - name: Add ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          Copy-Item (Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName build/windows/x64/runner/Release/
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
           name: abh-youtube-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: abh-youtube-windows
+          path: build/windows/x64/runner/Release
