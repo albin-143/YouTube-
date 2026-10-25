@@ -2052,12 +2052,15 @@ jobs:
         run: |
           sed -i 's/L"youtube_app"/L"ABH YouTube"/' windows/runner/main.cpp
           sed -i 's/set(BINARY_NAME "youtube_app")/set(BINARY_NAME "ABH_YouTube")/' windows/CMakeLists.txt
+          sed -i 's/add_definitions(-DUNICODE -D_UNICODE)/add_definitions(-DUNICODE -D_UNICODE -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)/' windows/CMakeLists.txt
       - run: flutter pub get
       - name: Build APK
         if: runner.os == 'Linux'
         run: flutter build apk --release
       - name: Build Windows
         if: runner.os == 'Windows'
+        env:
+          CL: -D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: flutter build windows --release
       - name: Add ffmpeg (Windows)
         if: runner.os == 'Windows'
