@@ -41,6 +41,7 @@ jobs:
             youtube_player_iframe: ^5.2.1
             youtube_explode_dart: ^2.3.0
             path_provider: ^2.1.0
+            webview_windows: ^0.4.0
           flutter:
             uses-material-design: true
           EOF
@@ -48,9 +49,11 @@ jobs:
           import 'dart:async';
           import 'dart:convert';
           import 'dart:io';
+          import 'package:flutter/gestures.dart' show PointerDeviceKind;
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:path_provider/path_provider.dart';
+          import 'package:webview_windows/webview_windows.dart';
           import 'package:youtube_player_iframe/youtube_player_iframe.dart';
           import 'package:youtube_explode_dart/youtube_explode_dart.dart' as yte;
 
@@ -72,6 +75,7 @@ jobs:
                   valueListenable: darkMode,
                   builder: (_, dark, __) => MaterialApp(
                     title: appName,
+                    scrollBehavior: const _AppScroll(),
                     themeMode: dark ? ThemeMode.dark : ThemeMode.light,
                     theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
                     darkTheme: ThemeData(
@@ -81,6 +85,17 @@ jobs:
                     home: const PlayerPage(),
                   ),
                 );
+          }
+
+          class _AppScroll extends MaterialScrollBehavior {
+            const _AppScroll();
+            @override
+            Set<PointerDeviceKind> get dragDevices => {
+                  PointerDeviceKind.touch,
+                  PointerDeviceKind.mouse,
+                  PointerDeviceKind.trackpad,
+                  PointerDeviceKind.stylus,
+                };
           }
 
           class _Opt {
@@ -151,10 +166,14 @@ jobs:
             int _filesTab = 0;
 
             YoutubePlayerController? _controller;
+            WebviewController? _wv;
+            bool _wvReady = false;
+            bool _wvShown = false;
 
             @override
             void initState() {
               super.initState();
+              if (_win) _initWv();
               try {
                 _controller = YoutubePlayerController.fromVideoId(
                   videoId: fallbackId,
@@ -244,30 +263,49 @@ jobs:
               }
             }
 
+            Future<void> _initWv() async {
+              try {
+                final c = WebviewController();
+                await c.initialize();
+                await c.setPopupWindowPolicy(WebviewPopupWindowPolicy.deny);
+                if (!mounted) return;
+                setState(() {
+                  _wv = c;
+                  _wvReady = true;
+                });
+              } catch (_) {
+                _wvReady = false; // WebView2 illana "Browser la paar" button varum
+              }
+            }
+
             Widget _playerWidget() {
-              final c = _controller;
-              if (c != null) return YoutubePlayer(controller: c, aspectRatio: 16 / 9);
-              return AspectRatio(
-                aspectRatio: 16 / 9,
-                child: Container(
+              if (_win) {
+                final w = _wv;
+                if (_wvReady && _wvShown && w != null) return Webview(w);
+                return Container(
                   color: Colors.black,
                   child: Stack(fit: StackFit.expand, children: [
                     if (_curId.isNotEmpty)
                       Image.network(
                         'https://img.youtube.com/vi/$_curId/hqdefault.jpg',
-                        fit: BoxFit.cover,
+                        fit: BoxFit.contain,
                         errorBuilder: (_, __, ___) => const SizedBox(),
                       ),
                     Center(
                       child: FilledButton.icon(
-                        onPressed: _openInBrowser,
-                        icon: const Icon(Icons.open_in_browser),
-                        label: const Text('Browser la paar'),
+                        onPressed: _wvReady
+                            ? () => _play(_curId, _curTitle)
+                            : _openInBrowser,
+                        icon: Icon(_wvReady ? Icons.play_arrow : Icons.open_in_browser),
+                        label: Text(_wvReady ? 'Play' : 'Browser la paar'),
                       ),
                     ),
                   ]),
-                ),
-              );
+                );
+              }
+              final c = _controller;
+              if (c != null) return YoutubePlayer(controller: c, aspectRatio: 16 / 9);
+              return const SizedBox();
             }
 
             Future<void> _init() async {
@@ -367,6 +405,10 @@ jobs:
 
             void _play(String id, String title) {
               _controller?.loadVideoById(videoId: id);
+              if (_win && _wvReady) {
+                _wv?.loadUrl('https://www.youtube.com/watch?v=$id');
+                _wvShown = true;
+              }
               setState(() {
                 _curId = id;
                 _curTitle = title;
@@ -1340,6 +1382,7 @@ jobs:
             void dispose() {
               _timer?.cancel();
               _controller?.close();
+              _wv?.dispose();
               _yt.close();
               _text.dispose();
               _homeCtl.dispose();
@@ -1347,7 +1390,7 @@ jobs:
               super.dispose();
             }
 
-            Widget _home() => Column(children: [
+            Widget _topBar() =>
                     AnimatedOpacity(
                       opacity: _barVisible ? 1 : 0,
                       duration: const Duration(milliseconds: 400),
@@ -1370,8 +1413,9 @@ jobs:
                           ]),
                         ),
                       ),
-                    ),
-                    _playerWidget(),
+                    );
+
+            Widget _searchRow() =>
                     Padding(
                       padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                       child: Row(children: [
@@ -1392,8 +1436,9 @@ jobs:
                           icon: const Icon(Icons.search),
                         ),
                       ]),
-                    ),
-                    if (_loading) const LinearProgressIndicator(),
+                    );
+
+            Widget _labelRow() =>
                     Align(
                       alignment: Alignment.centerLeft,
                       child: Padding(
@@ -1401,7 +1446,9 @@ jobs:
                         child: Text(_label,
                             style: const TextStyle(fontWeight: FontWeight.bold)),
                       ),
-                    ),
+                    );
+
+            Widget _listArea() =>
                     Expanded(
                       child: ListView.builder(
                         itemCount: _results.length,
@@ -1424,8 +1471,42 @@ jobs:
                           );
                         },
                       ),
-                    ),
-            ]);
+                    );
+
+            Widget _home() => LayoutBuilder(builder: (context, c) {
+                  if (_win && c.maxWidth > 900) {
+                    return Row(children: [
+                      SizedBox(
+                        width: 440,
+                        child: Column(children: [
+                          _searchRow(),
+                          if (_loading) const LinearProgressIndicator(),
+                          _labelRow(),
+                          _listArea(),
+                        ]),
+                      ),
+                      const VerticalDivider(width: 1),
+                      Expanded(
+                        child: Column(children: [
+                          _topBar(),
+                          Expanded(child: _playerWidget()),
+                        ]),
+                      ),
+                    ]);
+                  }
+                  final h = MediaQuery.of(context).size.height;
+                  return Column(children: [
+                    _topBar(),
+                    if (_win)
+                      SizedBox(height: h * 0.4, child: _playerWidget())
+                    else
+                      _playerWidget(),
+                    _searchRow(),
+                    if (_loading) const LinearProgressIndicator(),
+                    _labelRow(),
+                    _listArea(),
+                  ]);
+                });
 
             Future<bool> _confirm(String title, String body) async {
               final r = await showDialog<bool>(
